@@ -1,0 +1,31 @@
+{
+	admin off
+}
+
+:5000 {
+	root * /srv
+	header {
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Embedder-Policy "require-corp"
+		-Via
+	}
+	handle /api/* {
+		reverse_proxy api:8080
+	}
+	handle /webhooks/* {
+		reverse_proxy api:8080
+	}
+	handle /internal/* {
+		reverse_proxy api:8080
+	}
+	handle /rest/* {
+		reverse_proxy api:8080
+	}
+	handle /v0/* {
+		reverse_proxy api:8080
+	}
+	handle {
+		try_files {path} /index.html
+		file_server
+	}
+}

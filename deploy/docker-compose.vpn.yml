@@ -1,0 +1,23 @@
+services:
+  gluetun:
+    image: qmcgaw/gluetun
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    environment:
+      VPN_SERVICE_PROVIDER: "${VPN_PROVIDER:-airvpn}"
+      VPN_TYPE: "${VPN_TYPE:-wireguard}"
+      WIREGUARD_PRIVATE_KEY: "${VPN_PRIVATE_KEY:-}"
+      WIREGUARD_PRESHARED_KEY: "${VPN_PRESHARED_KEY:-}"
+      WIREGUARD_ADDRESSES: "${VPN_ADDRESSES:-}"
+      SERVER_COUNTRIES: "${VPN_COUNTRIES:-Germany}"
+      FIREWALL_VPN_INPUT_PORTS: "${QBIT_TORRENT_PORT:-6881}"
+    ports:
+      - "127.0.0.1:8088:8080"
+    restart: unless-stopped
+
+  qbittorrent:
+    network_mode: "service:gluetun"
+    ports: !reset []
+    depends_on:
+      gluetun:
+        condition: service_healthy

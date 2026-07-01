@@ -1,0 +1,58 @@
+services:
+  comet:
+    image: ghcr.io/torrin-app/torrin-addon:latest
+    environment:
+      ADDON_NAME: "Torrin"
+      ADDON_ID: "app.torrin.addon"
+      DATABASE_TYPE: "postgresql"
+      DATABASE_URL: "postgresql://comet:${COMET_DB_PASSWORD:-comet}@comet-postgres:5432/comet"
+      TORRINCACHE_URL: "${API_PUBLIC_URL}"
+      STREMTHRU_URL: "${API_PUBLIC_URL}"
+      SCRAPE_TORRINCACHE: "true"
+      HDENCODE_URL: "${API_PUBLIC_URL}"
+      SCRAPE_HDENCODE: "true"
+      SCENERLS_URL: "${API_PUBLIC_URL}"
+      SCRAPE_SCENERLS: "true"
+      TORRIN_LOCAL_ENABLED: "true"
+      TORRIN_LOCAL_URL: "http://api:8080"
+      TORRIN_LOCAL_SECRET: "${SIGNING_KEY}"
+      TORRIN_PREWARM: "true"
+      TORRIN_PREWARM_URL: "http://api:8080"
+      TORRIN_PREWARM_SECRET: "${SIGNING_KEY}"
+      TORRIN_SEARCH_KEY: "${TORRIN_SEARCH_KEY:-}"
+      SCRAPE_JACKETT: "true"
+      JACKETT_URL: "http://jackett:9117"
+      JACKETT_API_KEY: "${JACKETT_API_KEY:-}"
+      SCRAPE_ZILEAN: "false"
+      SCRAPE_TORRENTIO: "false"
+      BACKGROUND_SCRAPER_ENABLED: "true"
+      BACKGROUND_SCRAPER_CONCURRENT_WORKERS: "3"
+      BACKGROUND_SCRAPER_MAX_MOVIES_PER_RUN: "40"
+      DISABLE_TORRENT_STREAMS: "true"
+    depends_on:
+      comet-postgres: { condition: service_started }
+    restart: unless-stopped
+
+  comet-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: comet
+      POSTGRES_PASSWORD: "${COMET_DB_PASSWORD:-comet}"
+      POSTGRES_DB: comet
+    volumes:
+      - comet_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  jackett:
+    image: lscr.io/linuxserver/jackett:latest
+    environment:
+      PUID: "0"
+      PGID: "0"
+      TZ: "UTC"
+    volumes:
+      - jackett_config:/config
+    restart: unless-stopped
+
+volumes:
+  comet_pgdata:
+  jackett_config:

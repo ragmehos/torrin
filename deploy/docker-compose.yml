@@ -1,0 +1,231 @@
+# Go services run as images pulled from GHCR (built by CI, never on this box).
+# Deploy: docker compose -f deploy/docker-compose.yml pull && up -d.
+# TORRIN_TAG picks the version (default latest; set edge for newest main, or v6.0.0).
+# GHCR_REPO overrides the registry path. (build.sh stays only for local dev → ko.local.)
+#
+# The x- keys are ignored by compose; *aliases pull them in.
+x-s3: &s3 # shared object-store + signing config
+  S3_ENDPOINT: "${S3_ENDPOINT:-http://garage:3900}"
+  S3_ACCESS_KEY: "${S3_ACCESS_KEY:-GKdeadbeefdeadbeefdeadbeef}"
+  S3_SECRET_KEY: "${S3_SECRET_KEY:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}"
+  S3_BUCKET: "${S3_BUCKET:-torrin}"
+  SIGNING_KEY: "${SIGNING_KEY:-dev-signing-key}"
+  CREDS_KEY: "${CREDS_KEY:-}"
+
+x-db: &db "postgres://torrin:torrin@postgres:5432/torrin?sslmode=disable"
+x-nats: &nats "nats://nats:4222"
+x-public-url: &public-url "${PUBLIC_URL:-http://localhost:8084}" # where the stream service is reachable
+x-qbit: &qbit-url "${QBIT_URL:-http://qbittorrent:8080}"
+
+x-restart: &restart unless-stopped # auto-restart on crash + host reboot
+x-needs-db: &needs-db # wait for postgres ready (not just started) + nats up
+  postgres: { condition: service_healthy }
+  nats: { condition: service_started }
+x-needs-pg: &needs-pg
+  postgres: { condition: service_healthy }
+
+services:
+  postgres:
+    image: postgres:17
+    environment: { POSTGRES_USER: torrin, POSTGRES_PASSWORD: torrin, POSTGRES_DB: torrin }
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    restart: *restart
+    healthcheck: # dependents wait on this — kills the initdb cold-start race
+      test: ["CMD-SHELL", "pg_isready -U torrin"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  nats:
+    image: nats:2
+    command: ["-js"]
+    ports: ["127.0.0.1:4222:4222"]
+    restart: *restart
+
+  # qBittorrent download engine. qbit-init.sh seeds a default config on first run so
+  # torrin reaches qbit password-free over the docker network (no temp-password dance).
+  # Add your LAN to QBIT_WEBUI_WHITELIST to also open the WebUI from your own machine.
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    environment:
+      PUID: "0"
+      PGID: "0"
+      WEBUI_PORT: "8080"
+      QBIT_WEBUI_WHITELIST: "${QBIT_WEBUI_WHITELIST:-172.16.0.0/12}"
+      QBIT_TORRENT_PORT: "${QBIT_TORRENT_PORT:-6881}"
+    volumes:
+      - qbit_config:/config
+      - /mnt/cache/qbit:/downloads
+      - ./qbit-init.sh:/custom-cont-init.d/10-torrin-qbit.sh:ro
+    ports: ["127.0.0.1:8088:8080"]
+    restart: *restart
+
+  garage:
+    image: dxflrs/garage:v1.0.1
+    environment:
+      GARAGE_RPC_SECRET: "${GARAGE_RPC_SECRET:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}"
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage_meta:/var/lib/garage/meta
+      - /mnt/cache/garage:/var/lib/garage/data
+    ports: ["127.0.0.1:3900:3900"]
+    restart: *restart
+
+  api:
+    image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/api:${TORRIN_TAG:-latest}"
+    environment:
+      <<: *s3
+      PORT: "8080"
+      DATABASE_URL: *db
+      NATS_URL: *nats
+      PUBLIC_URL: *public-url
+      NODE_STREAM_BASES: "${NODE_STREAM_BASES:-}" # cluster: "node1=http://a:8084,node2=http://b:8084"
+      BUDGET_MAX_BYTES: "${BUDGET_MAX_BYTES:-1000000000000}" # 1 TB cap on in-flight downloads
+      EVICTION_CAP_BYTES: "${EVICTION_CAP_BYTES:-300000000000}" # 300 GB cache soft cap
+      EVICTION_HOUR: "${EVICTION_HOUR:-4}"
+      GUMROAD_SECRET: "${GUMROAD_SECRET:-}"
+      GUMROAD_SELLER_ID: "${GUMROAD_SELLER_ID:-}"
+      RATE_LIMIT_RPS: "${RATE_LIMIT_RPS:-30}" # per-key req/s; 0 disables
+      RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-60}"
+      TORRIN_SEARCH_KEY: "${TORRIN_SEARCH_KEY:-}" # exempt from rate limit (comet's high-volume search calls)
+      QBIT_URL: *qbit-url
+      QBIT_USER: "${QBIT_USER:-admin}"
+      QBIT_PASS: "${QBIT_PASS:-adminadmin}"
+      RD_API_KEY: "${RD_API_KEY:-}" # system RD key — StremThru live cache check
+      AD_API_KEY: "${AD_API_KEY:-}" # system AD key — StremThru live cache check
+      TORRENTCLAW_API_KEY: "${TORRENTCLAW_API_KEY:-}" # non-jamming live debrid cache check
+      USENET_INDEXER_URL: "${USENET_INDEXER_URL:-}" # operator Newznab indexer (Spotweb/NZBHydra2), BYOI fallback
+      USENET_INDEXER_KEY: "${USENET_INDEXER_KEY:-}"
+      TELEGRAM_BOT_USERNAME: "${TELEGRAM_BOT_USERNAME:-}" # for the account-link deeplink
+      EMAIL_API_KEY: "${EMAIL_API_KEY:-}" # usesendi/Brevo key; empty = no welcome emails
+      EMAIL_FROM: "${EMAIL_FROM:-torrin <hi@torrin.app>}"
+      RESELLER_KEY: "${RESELLER_KEY:-}" # shared secret for the reseller mint/list API
+      RCLONE_RC_URL: "${RCLONE_RC_URL:-http://rclone:5572}" # proxies rclone-backed BYOS streams
+      API_PUBLIC_URL: "${API_PUBLIC_URL:-}" # api's externally-reachable base (BYOS OAuth redirect_uri)
+      WEB_URL: "${WEB_URL:-}" # web app base (post-OAuth redirect)
+      # BYOS cloud OAuth apps (operator-registered; empty = that provider disabled)
+      DROPBOX_CLIENT_ID: "${DROPBOX_CLIENT_ID:-}"
+      DROPBOX_CLIENT_SECRET: "${DROPBOX_CLIENT_SECRET:-}"
+      ONEDRIVE_CLIENT_ID: "${ONEDRIVE_CLIENT_ID:-}"
+      ONEDRIVE_CLIENT_SECRET: "${ONEDRIVE_CLIENT_SECRET:-}"
+      GDRIVE_CLIENT_ID: "${GDRIVE_CLIENT_ID:-}"
+      GDRIVE_CLIENT_SECRET: "${GDRIVE_CLIENT_SECRET:-}"
+      PCLOUD_CLIENT_ID: "${PCLOUD_CLIENT_ID:-}"
+      PCLOUD_CLIENT_SECRET: "${PCLOUD_CLIENT_SECRET:-}"
+    ports: ["8080:8080"]
+    depends_on: *needs-db
+    restart: *restart
+
+  scheduler:
+    image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/scheduler:${TORRIN_TAG:-latest}"
+    environment: { PORT: "8081" }
+    depends_on: *needs-db
+    restart: *restart
+
+  catalog:
+    image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/catalog:${TORRIN_TAG:-latest}"
+    environment: { PORT: "8082" }
+    depends_on: *needs-db
+    restart: *restart
+
+  ingest:
+    image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/ingest:${TORRIN_TAG:-latest}"
+    user: "0:0" # writes to /scratch + reads the shared qbit downloads
+    environment:
+      <<: *s3
+      PORT: "8083"
+      DATABASE_URL: *db
+      NATS_URL: *nats
+      NODE_ID: "${NODE_ID:-}" # cluster: this box's id, stamped on jobs it publishes (empty = single-box)
+      SCRATCH_DIR: "/scratch"
+      RD_API_KEY: "${RD_API_KEY:-}"
+      AD_API_KEY: "${AD_API_KEY:-}"
+      QBIT_URL: *qbit-url
+      QBIT_USER: "${QBIT_USER:-admin}"
+      QBIT_PASS: "${QBIT_PASS:-adminadmin}"
+      # operator usenet account (fallback when a user hasn't set their own); empty = disabled
+      USENET_HOST: "${USENET_HOST:-}"
+      USENET_PORT: "${USENET_PORT:-563}"
+      USENET_USER: "${USENET_USER:-}"
+      USENET_PASS: "${USENET_PASS:-}"
+      USENET_SSL: "${USENET_SSL:-true}"
+      USENET_MAXCONNS: "${USENET_MAXCONNS:-20}"
+    volumes:
+      - /mnt/cache/ingest-scratch:/scratch
+      - /mnt/cache/qbit:/downloads # shared with qbittorrent so ingest reads completed files
+    depends_on:
+      <<: *needs-db
+      qbittorrent: { condition: service_started }
+    restart: *restart
+
+  stream:
+    image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/stream:${TORRIN_TAG:-latest}"
+    environment:
+      <<: *s3
+      PORT: "8084"
+      CORS_ORIGIN: "${CORS_ORIGIN:-*}"
+      API_URL: "${API_URL:-http://api:8080}"
+    restart: *restart
+    ports: ["8084:8084"]
+
+  stremio:
+    image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/stremio:${TORRIN_TAG:-latest}"
+    environment: { <<: *s3, PORT: "7000", DATABASE_URL: *db, PUBLIC_URL: *public-url }
+    ports: ["7000:7000"]
+    depends_on: *needs-pg
+    restart: *restart
+
+  webdav:
+    image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/webdav:${TORRIN_TAG:-latest}"
+    environment: { <<: *s3, PORT: "9092", DATABASE_URL: *db, PUBLIC_URL: *public-url }
+    ports: ["9092:9092"]
+    depends_on: *needs-pg
+    restart: *restart
+
+  # forked rclone (torrin-app/rclone) — NOT upstream; see deploy/Dockerfile.rclone
+  rclone:
+    image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/rclone:${TORRIN_TAG:-latest}"
+    ports: ["127.0.0.1:5572:5572"]
+    volumes: [rclone_config:/data]
+    restart: *restart
+
+  byos:
+    image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/byos:${TORRIN_TAG:-latest}"
+    environment:
+      <<: *s3
+      PORT: "8085"
+      DATABASE_URL: *db
+      NATS_URL: *nats
+      RCLONE_RC_URL: "${RCLONE_RC_URL:-http://rclone:5572}"
+    depends_on:
+      <<: *needs-db
+      rclone: { condition: service_started }
+    restart: *restart
+
+  telegram:
+    image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/telegram:${TORRIN_TAG:-latest}"
+    user: "0:0" # downloads media to /scratch
+    environment:
+      <<: *s3
+      PORT: "8086"
+      DATABASE_URL: *db
+      NATS_URL: *nats # publish JobComplete so BYOS mirrors Telegram-ingested files
+      PUBLIC_URL: *public-url
+      SCRATCH_DIR: "/scratch"
+      TELEGRAM_TMP_PATH: "/scratch/telegram"
+      # from my.telegram.org + @BotFather; empty TELEGRAM_BOT_TOKEN = bot disabled (health stub only)
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID:-}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_BOT_USERNAME: "${TELEGRAM_BOT_USERNAME:-}"
+    volumes:
+      - /mnt/cache/telegram-scratch:/scratch
+    depends_on: *needs-db # postgres + nats (bus: publishes JobComplete)
+    restart: *restart
+
+volumes:
+  pgdata:
+  garage_meta:
+  qbit_config:
+  rclone_config:

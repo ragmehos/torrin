@@ -1,0 +1,118 @@
+package server
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/torrin-app/torrin/shared/manifest"
+	"github.com/torrin-app/torrin/shared/storage"
+)
+
+type fakeStorage struct {
+	data         []byte
+	manifestJSON []byte
+	valid        bool
+}
+
+func (f *fakeStorage) Verify(string, int64, string, string) bool { return f.valid }
+
+func (f *fakeStorage) GetBytes(context.Context, string) ([]byte, error) {
+	if f.manifestJSON != nil {
+		return f.manifestJSON, nil
+	}
+	return f.data, nil
+}
+
+func (f *fakeStorage) Head(context.Context, string) (*storage.Object, error) {
+	return &storage.Object{Size: int64(len(f.data)), ContentType: "video/x-matroska"}, nil
+}
+
+func (f *fakeStorage) Get(_ context.Context, _, rng string) (*storage.Object, error) {
+	o := &storage.Object{Body: io.NopCloser(bytes.NewReader(f.data)), Size: int64(len(f.data)), ContentType: "video/x-matroska"}
+	if rng != "" {
+		o.ContentRange = "bytes 0-9/" + strconv.Itoa(len(f.data))
+		o.Size = 10
+	}
+	return o, nil
+}
+
+func do(srv *Server, method, target string, header http.Header) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, target, nil)
+	for k, v := range header {
+		r.Header[k] = v
+	}
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, r)
+	return w
+}
+
+func TestMissingSignature(t *testing.T) {
+	srv := New(&fakeStorage{valid: true}, "*", "")
+	if w := do(srv, "GET", "/hash/file_0/movie.mkv", nil); w.Code != 401 {
+		t.Fatalf("got %d, want 401", w.Code)
+	}
+}
+
+func TestBadSignature(t *testing.T) {
+	srv := New(&fakeStorage{valid: false}, "*", "")
+	if w := do(srv, "GET", "/hash/file_0/movie.mkv?expires=9999999999&sig=bad", nil); w.Code != 403 {
+		t.Fatalf("got %d, want 403", w.Code)
+	}
+}
+
+func TestServeFull(t *testing.T) {
+	srv := New(&fakeStorage{data: []byte("hello world"), valid: true}, "*", "")
+	w := do(srv, "GET", "/hash/file_0/movie.mkv?expires=9999999999&sig=ok", nil)
+	if w.Code != 200 || w.Body.String() != "hello world" {
+		t.Fatalf("got %d body=%q", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Accept-Ranges") != "bytes" {
+		t.Error("missing Accept-Ranges")
+	}
+}
+
+func TestServeRange(t *testing.T) {
+	srv := New(&fakeStorage{data: []byte("hello world"), valid: true}, "*", "")
+	w := do(srv, "GET", "/hash/file_0/movie.mkv?expires=9999999999&sig=ok", http.Header{"Range": {"bytes=0-9"}})
+	if w.Code != 206 {
+		t.Fatalf("got %d, want 206", w.Code)
+	}
+	if w.Header().Get("Content-Range") == "" {
+		t.Error("missing Content-Range")
+	}
+}
+
+func TestZipDownload(t *testing.T) {
+	hash := strings.Repeat("a", 40)
+	m := manifest.Manifest{InfoHash: hash, Name: "Show.S01", Files: []manifest.File{
+		{FileName: "ep1.mkv", FileSize: 5},
+		{FileName: "ep2.mkv", FileSize: 5},
+	}}
+	mj, _ := m.Marshal()
+	srv := New(&fakeStorage{data: []byte("hello"), manifestJSON: mj, valid: true}, "*", "")
+
+	w := do(srv, "GET", "/"+manifest.ZipKey(hash)+"?expires=9999999999&sig=x", nil)
+	if w.Code != 200 {
+		t.Fatalf("code %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/zip" {
+		t.Errorf("content-type %q", ct)
+	}
+	if cd := w.Header().Get("Content-Disposition"); !strings.Contains(cd, `"Show.S01.zip"`) {
+		t.Errorf("disposition %q", cd)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(w.Body.Bytes()), int64(w.Body.Len()))
+	if err != nil {
+		t.Fatalf("zip read: %v", err)
+	}
+	if len(zr.File) != 2 || zr.File[0].Name != "ep1.mkv" || zr.File[1].Name != "ep2.mkv" {
+		t.Fatalf("unexpected zip contents: %+v", zr.File)
+	}
+}

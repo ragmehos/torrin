@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; echo "above files need gofmt"; exit 1; }
+      - name: max 350 lines per Go file (house style)
+        run: |
+          fail=0
+          while read -r f; do
+            head -3 "$f" | grep -q 'Code generated' && continue   # skip generated files
+            n=$(wc -l < "$f")
+            [ "$n" -gt 350 ] && { printf '  %4d  %s\n' "$n" "$f"; fail=1; }
+          done < <(find . -name '*.go' -not -path './vendor/*')
+          [ "$fail" = 1 ] && { echo "::error::Go files above 350 lines — split them (house style)."; exit 1; }
+          echo "All Go files within 350 lines ✅"
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  staticcheck:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      - run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
+  govulncheck:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  edge-images:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-images.yml
+    with:
+      tags: edge

@@ -1,0 +1,35 @@
+name: Require Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  require-tests:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-tests') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: feat/fix PRs must include a test
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          if ! echo "$TITLE" | grep -qE '^(feat|fix)(\(.+\))?!?:'; then
+            echo "Not a feat/fix PR — tests not required. ✅"; exit 0
+          fi
+          git fetch -q origin "$BASE"
+          files=$(git diff --name-only "origin/$BASE...HEAD")
+          code=$(echo "$files"  | grep -E '\.go$' | grep -v '_test\.go$' || true)
+          tests=$(echo "$files" | grep -E '_test\.go$' || true)
+          if [ -n "$code" ] && [ -z "$tests" ]; then
+            echo "::error::This feat/fix PR changes Go code but adds/updates no *_test.go."
+            echo "Add a test — or, if it truly can't be tested, retitle as refactor:/chore: or add the 'skip-tests' label."
+            exit 1
+          fi
+          echo "Test present (or no Go code changed). ✅"

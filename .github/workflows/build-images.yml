@@ -1,0 +1,81 @@
+name: build-images
+
+on:
+  workflow_call:
+    inputs:
+      tags:
+        description: 'space-separated image tags, e.g. "v6.0.0 latest" or "edge"'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: 'space-separated image tags, e.g. "v1.0.0 latest"'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REPO: ghcr.io/${{ github.repository_owner }}/torrin
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build & push Go services (ko)
+        run: |
+          kotags="$(echo '${{ inputs.tags }}' | tr ' ' ',')"
+          for svc in api stream stremio webdav byos telegram catalog scheduler; do
+            echo ">> $svc ($kotags)"
+            KO_DOCKER_REPO="$REPO/$svc" \
+              go run github.com/google/ko@latest build \
+              --bare --platform=linux/amd64 --tags "$kotags" "./$svc/cmd"
+          done
+
+      - uses: docker/setup-buildx-action@v3
+      - name: Compose image refs
+        id: refs
+        run: |
+          ingest=""; rclone=""
+          for t in ${{ inputs.tags }}; do
+            ingest="$ingest,$REPO/ingest:$t"
+            rclone="$rclone,$REPO/rclone:$t"
+          done
+          echo "ingest=${ingest#,}" >> "$GITHUB_OUTPUT"
+          echo "rclone=${rclone#,}" >> "$GITHUB_OUTPUT"
+      - name: Build & push ingest
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.ingest
+          push: true
+          tags: ${{ steps.refs.outputs.ingest }}
+      - name: rclone fork rev (cache-bust)
+        id: rclonerev
+        run: |
+          sha=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+            https://api.github.com/repos/torrin-app/rclone/commits/master | jq -r '.sha // empty')
+          echo "sha=${sha:-${{ github.run_id }}}" >> "$GITHUB_OUTPUT"
+      - name: Build & push rclone
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.rclone
+          push: true
+          tags: ${{ steps.refs.outputs.rclone }}
+          build-args: |
+            RCLONE_REV=${{ steps.rclonerev.outputs.sha }}

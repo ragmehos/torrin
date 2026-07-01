@@ -1,0 +1,14 @@
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /ingest ./ingest/cmd
+
+FROM debian:bookworm-slim
+RUN sed -i -E 's/^(Components:.*)/\1 non-free/' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends par2 unrar ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /ingest /usr/local/bin/ingest
+EXPOSE 8083
+ENTRYPOINT ["ingest"]

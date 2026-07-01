@@ -1,0 +1,7 @@
+{
+	email {$ACME_EMAIL:contact@torrin.app}
+}
+
+{$STREAM_DOMAIN:stream-nl.torrin.app} {
+	reverse_proxy stream:8084
+}

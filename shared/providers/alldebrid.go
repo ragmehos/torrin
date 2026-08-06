@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/torrin-app/torrin/shared/breaker"
 )
 
 var adBase = "https://api.alldebrid.com"
@@ -232,7 +233,7 @@ const (
 func HosterUnlock(ctx context.Context, adKey, link string) (name, dl string, size int64, err error) {
 	u, err := newAlldebrid(adKey).unlock(ctx, link)
 	if err != nil {
-		return "", "", 0, err
+		return "", "", 0, hosterFailure(err)
 	}
 	return u.Filename, u.Link, u.FileSize, nil
 }
@@ -300,12 +301,7 @@ func (a *alldebrid) do(ctx context.Context, path string, form url.Values) (json.
 	req.URL.RawQuery = form.Encode()
 	req.Header.Set("Authorization", "Bearer "+a.key)
 
-	resp, err := a.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	_, body, err := breaker.RoundTrip("alldebrid", a.http, req)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +318,7 @@ func (a *alldebrid) do(ctx context.Context, path string, form url.Values) (json.
 	}
 	if r.Status != "success" {
 		if r.Error != nil {
-			return nil, fmt.Errorf("alldebrid %s: %s", r.Error.Code, r.Error.Message)
+			return nil, &adError{code: r.Error.Code, message: r.Error.Message}
 		}
 		return nil, fmt.Errorf("alldebrid: %s", body)
 	}

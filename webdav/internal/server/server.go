@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -41,18 +42,48 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+	var userID, authReason string
+	defer func() {
+		if sw.status >= 400 {
+			slog.Warn("webdav", "method", r.Method, "path", r.URL.Path, "status", sw.status, "user", userID, "reason", authReason)
+		}
+	}()
 	user, err := s.authenticate(r)
 	if err != nil {
-		w.Header().Set("WWW-Authenticate", `Basic realm="Torrin"`)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		authReason = err.Error()
+		if user != nil {
+			userID = user.ID
+		}
+		sw.Header().Set("WWW-Authenticate", `Basic realm="Torrin"`)
+		http.Error(sw, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	userID = user.ID
 	tree := buildTree(s.completed(r.Context(), user.ID))
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		s.get(w, r, user.ID, tree)
+		s.get(sw, r, user.ID, tree)
 		return
 	}
-	(&webdav.Handler{FileSystem: davFS{root: tree}, LockSystem: webdav.NewMemLS()}).ServeHTTP(w, r)
+	(&webdav.Handler{
+		FileSystem: davFS{root: tree},
+		LockSystem: webdav.NewMemLS(),
+		Logger: func(rq *http.Request, err error) {
+			if err != nil {
+				slog.Warn("webdav", "method", rq.Method, "path", rq.URL.Path, "err", err)
+			}
+		},
+	}).ServeHTTP(sw, r)
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+	sw.status = code
+	sw.ResponseWriter.WriteHeader(code)
 }
 
 func (s *Server) completed(ctx context.Context, userID string) []*jobs.Job {
@@ -77,7 +108,7 @@ func (s *Server) authenticate(r *http.Request) (*auth.User, error) {
 		return nil, fmt.Errorf("invalid api key")
 	}
 	if time.Now().After(user.ExpiresAt) {
-		return nil, fmt.Errorf("subscription expired")
+		return user, fmt.Errorf("subscription expired")
 	}
 	return user, nil
 }

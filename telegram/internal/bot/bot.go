@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/celestix/gotgproto"
 	"github.com/celestix/gotgproto/dispatcher/handlers"
@@ -47,7 +48,40 @@ type Bot struct {
 	Paid    func(userID string) bool
 	Ban     func(userID, reason string)
 
-	lim *userLimiter
+	lim   *userLimiter
+	dedup *dedupe
+}
+
+type dkey struct {
+	user int64
+	msg  int
+}
+
+type dedupe struct {
+	mu   sync.Mutex
+	seen map[dkey]time.Time
+	ttl  time.Duration
+}
+
+func newDedupe(ttl time.Duration) *dedupe {
+	return &dedupe{seen: map[dkey]time.Time{}, ttl: ttl}
+}
+
+func (d *dedupe) firstSight(user int64, msg int) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	for k, t := range d.seen {
+		if now.Sub(t) > d.ttl {
+			delete(d.seen, k)
+		}
+	}
+	key := dkey{user, msg}
+	if _, ok := d.seen[key]; ok {
+		return false
+	}
+	d.seen[key] = now
+	return true
 }
 
 func (b *Bot) Run(ctx context.Context) error {
@@ -58,6 +92,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		return fmt.Errorf("telegram: create tmp dir %s: %w", b.TmpDir, err)
 	}
 	b.lim = newUserLimiter()
+	b.dedup = newDedupe(2 * time.Minute)
 	client, err := gotgproto.NewClient(
 		b.AppID, b.APIHash,
 		gotgproto.ClientTypeBot(b.BotToken),
@@ -76,8 +111,12 @@ func (b *Bot) Run(ctx context.Context) error {
 
 func (b *Bot) onStart(ctx *ext.Context, u *ext.Update) error {
 	if tgUser := u.EffectiveUser(); tgUser != nil {
+		if !b.dedup.firstSight(tgUser.ID, u.EffectiveMessage.ID) {
+			return nil
+		}
 		if fields := strings.Fields(u.EffectiveMessage.Text); len(fields) > 1 {
-			if _, ok := b.Link(fields[1], tgUser.ID); ok {
+			if uid, ok := b.Link(fields[1], tgUser.ID); ok {
+				slog.Info("telegram: linked", "user", uid, "tg", tgUser.ID)
 				_, err := ctx.Reply(u, ext.ReplyTextString("✅ Linked. Forward me a video to cache it."), nil)
 				return err
 			}
@@ -96,12 +135,16 @@ func (b *Bot) onLink(ctx *ext.Context, u *ext.Update) error {
 	if tgUser == nil {
 		return nil
 	}
+	if !b.dedup.firstSight(tgUser.ID, u.EffectiveMessage.ID) {
+		return nil
+	}
 	fields := strings.Fields(u.EffectiveMessage.Text)
 	if len(fields) < 2 {
 		_, _ = ctx.Reply(u, ext.ReplyTextString("Usage: /link <code>, get one in Torrin settings"), nil)
 		return nil
 	}
-	if _, ok := b.Link(fields[1], tgUser.ID); ok {
+	if uid, ok := b.Link(fields[1], tgUser.ID); ok {
+		slog.Info("telegram: linked", "user", uid, "tg", tgUser.ID)
 		_, _ = ctx.Reply(u, ext.ReplyTextString("✅ Linked. Forward me a video to cache it."), nil)
 	} else {
 		_, _ = ctx.Reply(u, ext.ReplyTextString("❌ That code is invalid or expired."), nil)
@@ -112,6 +155,9 @@ func (b *Bot) onLink(ctx *ext.Context, u *ext.Update) error {
 func (b *Bot) onMedia(ctx *ext.Context, u *ext.Update) error {
 	tgUser := u.EffectiveUser()
 	if tgUser == nil {
+		return nil
+	}
+	if !b.dedup.firstSight(tgUser.ID, u.EffectiveMessage.ID) {
 		return nil
 	}
 	userID, ok := b.Resolve(tgUser.ID)
@@ -153,6 +199,7 @@ func (b *Bot) onMedia(ctx *ext.Context, u *ext.Update) error {
 		if v.Ban && b.Ban != nil {
 			b.Ban(userID, v.Reason)
 		}
+		slog.Warn("telegram: blocked content", "user", userID, "name", name, "reason", v.Reason, "banned", v.Ban)
 		_, _ = ctx.Reply(u, ext.ReplyTextString("❌ That file is blocked and can't be cached."), nil)
 		return nil
 	}
@@ -184,6 +231,7 @@ func (b *Bot) onMedia(ctx *ext.Context, u *ext.Update) error {
 		if b.Bus != nil {
 			b.Bus.Publish(events.JobComplete, events.Complete{JobID: job.ID, InfoHash: job.InfoHash})
 		}
+		slog.Info("telegram: cached", "user", userID, "name", name, "job", job.ID)
 		_, _ = ctx.Reply(u, ext.ReplyTextString("✅ Done, "+name+" is in your Torrin library. Play it in Stremio."), nil)
 	}()
 	return nil

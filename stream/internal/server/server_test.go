@@ -4,13 +4,16 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/torrin-app/torrin/shared/crypto"
 	"github.com/torrin-app/torrin/shared/manifest"
 	"github.com/torrin-app/torrin/shared/storage"
 )
@@ -19,6 +22,7 @@ type fakeStorage struct {
 	data         []byte
 	manifestJSON []byte
 	valid        bool
+	fetchErr     error
 }
 
 func (f *fakeStorage) Verify(string, int64, string, string) bool { return f.valid }
@@ -31,16 +35,101 @@ func (f *fakeStorage) GetBytes(context.Context, string) ([]byte, error) {
 }
 
 func (f *fakeStorage) Head(context.Context, string) (*storage.Object, error) {
+	if f.fetchErr != nil {
+		return nil, f.fetchErr
+	}
 	return &storage.Object{Size: int64(len(f.data)), ContentType: "video/x-matroska"}, nil
 }
 
 func (f *fakeStorage) Get(_ context.Context, _, rng string) (*storage.Object, error) {
+	if f.fetchErr != nil {
+		return nil, f.fetchErr
+	}
 	o := &storage.Object{Body: io.NopCloser(bytes.NewReader(f.data)), Size: int64(len(f.data)), ContentType: "video/x-matroska"}
 	if rng != "" {
 		o.ContentRange = "bytes 0-9/" + strconv.Itoa(len(f.data))
 		o.Size = 10
 	}
 	return o, nil
+}
+
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+func TestServeFetchFailureLogs(t *testing.T) {
+	buf := captureLogs(t)
+	srv := New(&fakeStorage{valid: true, fetchErr: errors.New("upstream down")}, "*", "", nil)
+	w := do(srv, "GET", "/hash/file_0/movie.mkv?expires=9999999999&sig=ok", nil)
+	if w.Code != 404 {
+		t.Fatalf("got %d, want 404", w.Code)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "stream: fetch failed") || !strings.Contains(out, "upstream down") {
+		t.Errorf("expected fetch-failed log, got: %q", out)
+	}
+}
+
+func TestServeSuccessDoesNotWarn(t *testing.T) {
+	buf := captureLogs(t)
+	srv := New(&fakeStorage{data: []byte("hello world"), valid: true}, "*", "", nil)
+	if w := do(srv, "GET", "/hash/file_0/movie.mkv?expires=9999999999&sig=ok", nil); w.Code != 200 {
+		t.Fatalf("got %d, want 200", w.Code)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("successful serve must not warn, got: %q", buf.String())
+	}
+}
+
+func TestServeZipDecryptsEncryptedBlobs(t *testing.T) {
+	cipher, err := crypto.NewStream(strings.Repeat("ab", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := append([]byte{0x1A, 0x45, 0xDF, 0xA3}, bytes.Repeat([]byte("matroska-payload"), 500)...)
+	enc, err := cipher.EncryptReader(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encBytes, err := io.ReadAll(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	man := manifest.Manifest{Name: "Show S01", Files: []manifest.File{
+		{FileName: "Show.S01E01.mkv", DirectURL: "blobs/b_deadbeef", FileSize: int64(len(plain)), Crc32: 0x12345678, Enc: true},
+	}}
+	mj, err := man.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(&fakeStorage{data: encBytes, manifestJSON: mj, valid: true}, "*", "", cipher)
+
+	hash := strings.Repeat("a", 40)
+	w := do(srv, "GET", "/"+hash+"/all.zip?expires=9999999999&sig=ok&u=u1", nil)
+	if w.Code != 200 {
+		t.Fatalf("code %d, want 200", w.Code)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(w.Body.Bytes()), int64(w.Body.Len()))
+	if err != nil {
+		t.Fatalf("output is not a valid zip: %v", err)
+	}
+	if len(zr.File) != 1 || zr.File[0].Name != "Show.S01E01.mkv" {
+		t.Fatalf("wrong zip contents: %+v", zr.File)
+	}
+	rc, err := zr.File[0].Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(rc)
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("zip entry not decrypted: got %d bytes, want %d", len(got), len(plain))
+	}
 }
 
 func do(srv *Server, method, target string, header http.Header) *httptest.ResponseRecorder {

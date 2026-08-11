@@ -1,12 +1,34 @@
 package handlers
 
 import (
+	"bytes"
+	"mime/multipart"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/usenet/indexer"
 )
+
+func TestReadNZBBody(t *testing.T) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("nzb", "x.nzb")
+	fw.Write([]byte("<nzb>multi</nzb>"))
+	mw.Close()
+	r := httptest.NewRequest("POST", "/api/jobs/nzb", &buf)
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	if got, err := readNZBBody(r); err != nil || string(got) != "<nzb>multi</nzb>" {
+		t.Fatalf("multipart: got %q err %v", got, err)
+	}
+
+	r2 := httptest.NewRequest("POST", "/api/jobs/nzb", strings.NewReader("<nzb>raw</nzb>"))
+	if got, err := readNZBBody(r2); err != nil || string(got) != "<nzb>raw</nzb>" {
+		t.Fatalf("raw: got %q err %v", got, err)
+	}
+}
 
 func TestUserJobForHash(t *testing.T) {
 	sibs := []*jobs.Job{
@@ -22,6 +44,23 @@ func TestUserJobForHash(t *testing.T) {
 	}
 	if userJobForHash([]*jobs.Job{{UserID: "u1", Status: jobs.StatusFailed}}, "u1") != nil {
 		t.Error("a failed job should not count (allows retry)")
+	}
+}
+
+func TestRecentlyFailed(t *testing.T) {
+	sibs := []*jobs.Job{
+		{UserID: "u1", Status: jobs.StatusComplete, UpdatedAt: time.Now()},
+		{UserID: "u1", Status: jobs.StatusFailed, UpdatedAt: time.Now().Add(-2 * time.Hour)},
+	}
+	if recentlyFailed(sibs, "u1", 30*time.Minute) != nil {
+		t.Error("a stale failure past the cooldown should allow retry")
+	}
+	sibs = append(sibs, &jobs.Job{UserID: "u1", Status: jobs.StatusFailed, UpdatedAt: time.Now()})
+	if recentlyFailed(sibs, "u1", 30*time.Minute) == nil {
+		t.Error("a fresh failure within the cooldown should suppress re-grab")
+	}
+	if recentlyFailed(sibs, "other", 30*time.Minute) != nil {
+		t.Error("another user's failure must not suppress this user")
 	}
 }
 

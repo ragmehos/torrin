@@ -87,7 +87,7 @@ func (r *Runner) process(ctx context.Context, job *jobs.Job) error {
 	}
 	parts, err := resolver.Resolve(ctx, job.Magnet, job.IMDBID, job.Name)
 	if err != nil {
-		return fmt.Errorf("resolve: %w", err)
+		return failure.Newf("resolve_failed", "%s", err)
 	}
 	if len(parts) == 0 {
 		return failure.Wrap(failure.NoSources, "no usable links found")
@@ -134,7 +134,7 @@ func (r *Runner) process(ctx context.Context, job *jobs.Job) error {
 	if err := r.pub.Publish(ctx, job, pubFiles); err != nil {
 		return fmt.Errorf("publish: %w", err)
 	}
-	r.bus.Publish(events.JobComplete, events.Complete{JobID: job.ID, InfoHash: job.InfoHash})
+	r.bus.Publish(events.JobComplete, events.Complete{JobID: job.ID, InfoHash: job.InfoHash, Node: job.Node})
 	slog.Info("release complete", "job", job.ID, "source", job.Source, "files", len(pubFiles))
 	return nil
 }

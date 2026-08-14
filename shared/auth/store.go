@@ -20,7 +20,7 @@ var ErrNotFound = errors.New("user not found")
 
 const userColumns = `id, email, api_key, plan_id, subscription_id, license_key, recurrence,
 	expires_at, paused_at, remaining_days, pause_count, last_paused_at, banned, ban_reason,
-	created_at, updated_at, seed_slot_packs, seed_slot_sub, system_indexer_enabled`
+	created_at, updated_at, seed_slot_packs, seed_slot_sub, system_indexer_enabled, totp_enabled`
 
 type Store struct {
 	pool  *pgxpool.Pool
@@ -58,6 +58,10 @@ func (s *Store) GetByAPIKey(ctx context.Context, apiKey string) (*User, error) {
 
 func (s *Store) GetByEmail(ctx context.Context, email string) (*User, error) {
 	return scanOne(s.pool.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE email=$1`, email))
+}
+
+func (s *Store) GetBySubscription(ctx context.Context, subID string) (*User, error) {
+	return scanOne(s.pool.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE subscription_id=$1 ORDER BY updated_at DESC LIMIT 1`, subID))
 }
 
 func (s *Store) CountUsers(ctx context.Context) int {
@@ -103,7 +107,7 @@ func scanOne(row pgx.Row) (*User, error) {
 	err := row.Scan(&u.ID, &u.Email, &u.APIKey, &u.PlanID, &u.SubscriptionID, &u.LicenseKey,
 		&u.Recurrence, &u.ExpiresAt, &pausedAt, &u.RemainingDays, &u.PauseCount, &lastPausedAt,
 		&u.Banned, &u.BanReason, &u.CreatedAt, &u.UpdatedAt, &u.SeedSlotPacks, &u.SeedSlotSub,
-		&u.SystemIndexerEnabled)
+		&u.SystemIndexerEnabled, &u.TOTPEnabled)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

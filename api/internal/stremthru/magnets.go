@@ -11,7 +11,6 @@ import (
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/keyed"
 	"github.com/torrin-app/torrin/shared/magnet"
-	"github.com/torrin-app/torrin/shared/manifest"
 	"github.com/torrin-app/torrin/shared/plans"
 )
 
@@ -63,7 +62,7 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 		source, mag, hdTitle, hdSize = jobs.Source(src), pURL, t, sz
 	}
 
-	cached := manifest.Playable(r.Context(), h.Store, infoHash)
+	cacheName, cacheSize, cacheFiles, cached := h.cachedJobFiles(r.Context(), infoHash)
 	plan, _ := plans.Get(user.PlanID)
 
 	existing, err := h.Jobs.GetByInfoHash(r.Context(), infoHash)
@@ -110,7 +109,10 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 	}
 	if cached {
 		job.Status = jobs.StatusComplete
-		job.Name, job.FileSize, job.Files = h.manifestMeta(r.Context(), infoHash)
+		if cacheName != "" {
+			job.Name = cacheName
+		}
+		job.FileSize, job.Files = cacheSize, cacheFiles
 	}
 	h.Jobs.Create(r.Context(), job)
 	if !cached {

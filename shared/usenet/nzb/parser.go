@@ -26,6 +26,14 @@ type Segment struct {
 	Bytes     int64
 }
 
+func (f File) Size() int64 {
+	var total int64
+	for _, s := range f.Segments {
+		total += s.Bytes
+	}
+	return total
+}
+
 func ParseBytes(data []byte) (*NZB, error) {
 	parsed, err := nzbparser.ParseString(string(data))
 	if err != nil {
@@ -64,9 +72,7 @@ func (n *NZB) Name() string {
 func (n *NZB) TotalSize() int64 {
 	var total int64
 	for _, f := range n.Files {
-		for _, s := range f.Segments {
-			total += s.Bytes
-		}
+		total += f.Size()
 	}
 	return total
 }

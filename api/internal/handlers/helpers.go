@@ -12,6 +12,7 @@ import (
 
 	"github.com/torrin-app/torrin/api/internal/middleware"
 	"github.com/torrin-app/torrin/api/internal/web"
+	"github.com/torrin-app/torrin/shared/cairn"
 	"github.com/torrin-app/torrin/shared/events"
 	"github.com/torrin-app/torrin/shared/georoute"
 	"github.com/torrin-app/torrin/shared/jobs"
@@ -83,6 +84,8 @@ func (s *Server) signStreams(job *jobs.Job, r *http.Request) []jobs.Stream {
 		if byos {
 			u = s.Store.SignURLNodeUser(job.Node, key, job.UserID, 24*time.Hour) + "&byos=1"
 			u += "&bk=" + url.QueryEscape(manifest.Key(job.InfoHash, i, f.Name))
+		} else if _, _, _, ok := cairn.ParseStreamPath(key); ok {
+			u = s.Store.SignURLNodeUser("", key, job.UserID, 24*time.Hour)
 		} else {
 			u = s.Store.SignURLNode(job.Node, key, 24*time.Hour)
 		}

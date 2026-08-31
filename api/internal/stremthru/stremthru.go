@@ -145,6 +145,7 @@ func (h *Handler) magnetData(ctx context.Context, j *jobs.Job) map[string]any {
 	if name, size, files, ok := h.cachedJobFiles(ctx, j.InfoHash); ok {
 		m["status"] = "downloaded"
 		m["size"] = size
+		files = jobs.FilesForEpisode(j, files, j.Season, j.Episode)
 		m["files"] = h.buildFileEntries(j.UserID, j.InfoHash, h.Jobs.NodeForInfoHash(ctx, j.InfoHash), files)
 		if name != "" {
 			m["name"] = name
@@ -154,6 +155,7 @@ func (h *Handler) magnetData(ctx context.Context, j *jobs.Job) map[string]any {
 		if _, _, mf := h.manifestMeta(ctx, j.InfoHash); mf != nil {
 			files = mf
 		}
+		files = jobs.FilesForEpisode(j, files, j.Season, j.Episode)
 		m["files"] = h.buildFileEntries(j.UserID, j.InfoHash, j.Node, files)
 	}
 	return m
@@ -162,7 +164,11 @@ func (h *Handler) magnetData(ctx context.Context, j *jobs.Job) map[string]any {
 func (h *Handler) buildFileEntries(userID, hash, node string, files []jobs.File) []map[string]any {
 	out := make([]map[string]any, len(files))
 	for i, f := range files {
-		key := manifest.ResolveKey(hash, i, f.Key, f.Name)
+		index := f.Index
+		if index == 0 && i > 0 {
+			index = i
+		}
+		key := manifest.ResolveKey(hash, index, f.Key, f.Name)
 		link := ""
 		if _, _, _, ok := cairn.ParseStreamPath(key); ok {
 			link = h.Store.SignURLNodeUser("", key, userID, 24*time.Hour)
@@ -170,7 +176,7 @@ func (h *Handler) buildFileEntries(userID, hash, node string, files []jobs.File)
 			link = h.Store.SignURLNode(node, key, 24*time.Hour)
 		}
 		link += manifest.StreamQuery(hash, f.Enc)
-		out[i] = fileEntry(i, f.Name, f.Size, link, f.MediaInfo)
+		out[i] = fileEntry(index, f.Name, f.Size, link, f.MediaInfo)
 	}
 	return out
 }

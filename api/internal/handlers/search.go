@@ -118,26 +118,11 @@ type searchResult struct {
 }
 
 func episodeMatch(j *jobs.Job, fileName string, season, episode int) bool {
-	if j.Season > 0 || j.Episode > 0 {
-		return j.Season == season && j.Episode == episode
-	}
-	return fileMatchesEpisode(fileName, season, episode)
+	return jobs.MatchesEpisodeFile(j, fileName, season, episode)
 }
 
 func fileMatchesEpisode(fileName string, season, episode int) bool {
-	info, err := tnp.ParseName(strings.ReplaceAll(fileName, ".", " "))
-	if err != nil || info.Episode != episode {
-		return false
-	}
-	if len(info.Seasons) == 0 {
-		return season == 1
-	}
-	for _, sn := range info.Seasons {
-		if sn == season {
-			return true
-		}
-	}
-	return false
+	return jobs.MatchesEpisodeFile(nil, fileName, season, episode)
 }
 
 func yearMatches(releaseName string, year int) bool {

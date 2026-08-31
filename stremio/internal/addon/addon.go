@@ -14,6 +14,7 @@ import (
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/manifest"
 	"github.com/torrin-app/torrin/shared/storage"
+	"github.com/torrin-app/torrin/shared/stremioid"
 )
 
 type Server struct {
@@ -67,35 +68,24 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	byos := s.userHasBYOS(r.Context(), user.ID)
-	imdbID, infoHash := parseID(contentID)
+	id := stremioid.Parse(contentID)
 	var streams []map[string]any
-	if infoHash != "" {
-		streams = append(streams, s.byHash(r, infoHash, user.ID, byos)...)
+	if id.InfoHash != "" {
+		streams = append(streams, s.byHash(r, id.InfoHash, user.ID, byos)...)
 	}
-	if imdbID != "" {
-		streams = append(streams, s.byLibrary(r, r.PathValue("type"), imdbID, user.ID, byos)...)
+	if id.IMDBID != "" {
+		streams = append(streams, s.byLibrary(r, r.PathValue("type"), id, user.ID, byos)...)
 	}
 
 	if len(streams) == 0 {
 		writeJSON(w, 200, empty)
 		return
 	}
-	if infoHash != "" {
-		s.jobs.RecordView(r.Context(), infoHash, user.ID)
+	if id.InfoHash != "" {
+		s.jobs.RecordView(r.Context(), id.InfoHash, user.ID)
 	}
 	slog.Info("stremio: served", "user", user.ID, "id", contentID, "streams", len(streams))
 	writeJSON(w, 200, map[string]any{"streams": streams})
-}
-
-func parseID(contentID string) (imdbID, infoHash string) {
-	candidate := strings.Split(contentID, ":")[0]
-	if strings.HasPrefix(candidate, "tt") {
-		return strings.TrimPrefix(candidate, "tt"), ""
-	}
-	if len(candidate) == 40 {
-		return "", strings.ToLower(candidate)
-	}
-	return "", ""
 }
 
 func (s *Server) byHash(r *http.Request, infoHash, userID string, byos bool) []map[string]any {
@@ -131,7 +121,7 @@ func (s *Server) streamURL(r *http.Request, infoHash, key, userID string, byos, 
 	return georoute.URL(r, u)
 }
 
-func (s *Server) byLibrary(r *http.Request, contentType, imdbID, userID string, byos bool) []map[string]any {
+func (s *Server) byLibrary(r *http.Request, contentType string, id stremioid.ID, userID string, byos bool) []map[string]any {
 	ctx := r.Context()
 	seen := map[string]bool{}
 	var out []map[string]any
@@ -140,29 +130,37 @@ func (s *Server) byLibrary(r *http.Request, contentType, imdbID, userID string, 
 			if seen[j.InfoHash] {
 				continue
 			}
+			files := libraryFiles(j, id)
+			if len(files) == 0 {
+				continue
+			}
 			seen[j.InfoHash] = true
-			for i, f := range j.Files {
-				key := manifest.ResolveKey(j.InfoHash, i, f.Key, f.Name)
+			for _, f := range files {
+				key := manifest.ResolveKey(j.InfoHash, f.Index, f.Key, f.Name)
 				out = append(out, entry(f.Name, s.streamURL(r, j.InfoHash, key, userID, byos, f.Enc)))
 			}
 		}
 	}
 
-	byImdb, _ := s.jobs.ListByIMDB(ctx, imdbID)
+	byImdb, _ := s.jobs.ListByIMDB(ctx, id.IMDBID)
 	add(byImdb)
 
 	if byos {
-		byosOwn, _ := s.jobs.ListUserByosByIMDB(ctx, userID, imdbID)
+		byosOwn, _ := s.jobs.ListUserByosByIMDB(ctx, userID, id.IMDBID)
 		add(byosOwn)
 	}
 
-	if title, err := s.meta.Title(ctx, imdbID, contentType); err == nil {
+	if title, err := s.meta.Title(ctx, id.IMDBID, contentType); err == nil {
 		if norm := jobs.NormTitle(title); norm != "" {
 			byTitle, _ := s.jobs.ListByTitleNorm(ctx, norm)
 			add(byTitle)
 		}
 	}
 	return out
+}
+
+func libraryFiles(j *jobs.Job, id stremioid.ID) []jobs.File {
+	return jobs.FilesForEpisode(j, j.Files, id.Season, id.Episode)
 }
 
 func entry(title, url string) map[string]any {

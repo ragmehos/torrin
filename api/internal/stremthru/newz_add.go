@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime"
 	"net/http"
@@ -155,17 +156,21 @@ func (h *Handler) ensureNewzJob(ctx context.Context, user *auth.User, plan plans
 		}
 		linked := &jobs.Job{UserID: user.ID, InfoHash: contentHash, Name: existing.Name, Source: jobs.SourceUsenet, Status: existing.Status, Files: existing.Files, FileSize: existing.FileSize, Node: existing.Node}
 		active := existing.Status.Active()
-		if active && !h.Slots.Acquire(ctx, user.ID, plan) {
-			return "", 429, "slot limit reached"
-		}
-		if err := h.Jobs.Create(ctx, linked); err != nil {
-			if active {
-				h.Slots.Release(user.ID)
-			}
-			return "", 500, "could not start this download"
-		}
 		if active {
-			h.Slots.Release(user.ID)
+			disposition, err := h.Slots.Admit(ctx, linked, plan, false)
+			if err != nil {
+				if errors.Is(err, jobs.ErrQueueFull) {
+					return "", 429, "download queue full"
+				}
+				return "", 500, "could not queue this download"
+			}
+			linked.Node = existing.Node
+			if disposition == jobs.AdmissionAdmitted && existing.Status != jobs.StatusQueued {
+				linked.Status = existing.Status
+			}
+			h.Jobs.Update(ctx, linked)
+		} else if err := h.Jobs.Create(ctx, linked); err != nil {
+			return "", 500, "could not start this download"
 		}
 		return stStatus(linked.Status), 0, ""
 	}
@@ -176,23 +181,23 @@ func (h *Handler) ensureNewzJob(ctx context.Context, user *auth.User, plan plans
 	if ok, _ := h.Jobs.ColdPullAllowed(ctx, user.ID, plan.ColdPullsPerHour); !ok {
 		return "", 429, "hourly download limit reached, try later or upgrade"
 	}
-	if !h.Slots.Acquire(ctx, user.ID, plan) {
-		return "", 429, "slot limit reached"
-	}
 	if err := h.Store.Put(ctx, nzb.StorageKey(contentHash), bytes.NewReader(body), "application/x-nzb"); err != nil {
-		h.Slots.Release(user.ID)
 		return "", 500, "failed to store nzb"
 	}
 	h.Users.SetJobNZB(ctx, contentHash, body)
 	job := &jobs.Job{UserID: user.ID, InfoHash: contentHash, Name: name, FileSize: size, Source: jobs.SourceUsenet, Status: jobs.StatusPending, MaxBytes: plan.MaxTorrentBytes, Priority: plan.Priority}
-	err := h.Jobs.Create(ctx, job)
-	h.Slots.Release(user.ID)
+	disposition, err := h.Slots.Admit(ctx, job, plan, false)
 	if err != nil {
-		return "", 500, "could not start this download"
+		if errors.Is(err, jobs.ErrQueueFull) {
+			return "", 429, "download queue full"
+		}
+		return "", 500, "could not queue this download"
 	}
-	job.Node = cluster.TargetNode(context.Background(), h.Jobs, string(jobs.SourceUsenet), job.MaxBytes)
-	h.Jobs.Update(context.Background(), job)
-	h.Bus.Publish(events.JobAssigned, events.Assigned{JobID: job.ID, InfoHash: job.InfoHash, Source: string(jobs.SourceUsenet), MaxBytes: job.MaxBytes, Node: job.Node})
+	if disposition == jobs.AdmissionAdmitted {
+		job.Node = cluster.TargetNode(context.Background(), h.Jobs, string(jobs.SourceUsenet), job.MaxBytes)
+		h.Jobs.Update(context.Background(), job)
+		h.Bus.Publish(events.JobAssigned, events.Assigned{JobID: job.ID, InfoHash: job.InfoHash, Source: string(jobs.SourceUsenet), MaxBytes: job.MaxBytes, Node: job.Node})
+	}
 	return "queued", 0, ""
 }
 

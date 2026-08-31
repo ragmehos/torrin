@@ -61,6 +61,7 @@ func (f fakeStore) GetBytes(context.Context, string) ([]byte, error) {
 	return f.manifest, f.err
 }
 func (f fakeStore) Put(context.Context, string, io.Reader, string) error { return nil }
+func (f fakeStore) Delete(context.Context, string) error                 { return nil }
 func (f fakeStore) SignURL(path string, _ time.Duration) string          { return "sign://" + path }
 func (f fakeStore) SignURLNode(node, path string, _ time.Duration) string {
 	return "sign://" + node + "/" + path

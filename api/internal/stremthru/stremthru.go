@@ -26,6 +26,7 @@ type store interface {
 	Has(ctx context.Context, key string) (bool, error)
 	GetBytes(ctx context.Context, key string) ([]byte, error)
 	Put(ctx context.Context, key string, body io.Reader, contentType string) error
+	Delete(ctx context.Context, key string) error
 	SignURL(path string, expiry time.Duration) string
 	SignURLNode(node, path string, expiry time.Duration) string
 	SignURLNodeUser(node, path, userID string, expiry time.Duration) string

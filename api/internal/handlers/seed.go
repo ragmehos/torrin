@@ -74,30 +74,28 @@ func (s *Server) ingestTorrent(w http.ResponseWriter, r *http.Request, user *aut
 		web.WriteJSON(w, 200, existing)
 		return
 	}
-	if !s.Slots.Acquire(r.Context(), user.ID, plan) {
-		web.WriteError(w, 429, slotMsg(s, r, user.ID, plan.MaxConcurrent))
+	if over, _ := s.Users.MonthlyQuotaExceeded(r.Context(), user.ID, plan.MonthlyIngestBytes); over {
+		web.WriteError(w, 429, "monthly download limit reached, resets on the 1st")
 		return
 	}
-	if err := s.Qbit.Login(); err != nil {
-		s.Slots.Release(user.ID)
-		web.WriteError(w, 503, "torrent engine unavailable")
-		return
-	}
-	if err := s.Qbit.AddTorrentFile(data, "torrin"); err != nil {
-		s.Slots.Release(user.ID)
-		web.WriteError(w, 502, "failed to add torrent")
+	inputKey := torrentfile.InputKey(user.ID, meta.InfoHash)
+	if err := s.Store.Put(r.Context(), inputKey, bytes.NewReader(data), "application/x-bittorrent"); err != nil {
+		web.WriteError(w, 500, "failed to stage torrent")
 		return
 	}
 	job := &jobs.Job{
 		UserID: user.ID, InfoHash: meta.InfoHash, Name: meta.Name, FileSize: meta.Size,
-		Source: jobs.SourceTorrent, Status: jobs.StatusDownloading,
+		Source: jobs.SourceTorrent, InputKey: inputKey,
 		MaxBytes: plan.MaxTorrentBytes, Priority: plan.Priority,
 	}
-	err = s.Jobs.Create(r.Context(), job)
-	s.Slots.Release(user.ID)
+	disposition, err := s.Slots.Admit(r.Context(), job, plan, false)
 	if err != nil {
-		web.WriteError(w, 500, "could not start this download")
+		s.Store.Delete(r.Context(), inputKey)
+		writeQueueError(w, err, s.Slots.MaxQueued())
 		return
+	}
+	if disposition == jobs.AdmissionAdmitted {
+		s.assign(job)
 	}
 	web.WriteJSON(w, 202, job)
 }

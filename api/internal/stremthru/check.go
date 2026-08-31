@@ -88,7 +88,7 @@ func (h *Handler) checkMagnets(w http.ResponseWriter, r *http.Request, user *aut
 	// Tier 1: our shared cache. Fan out (each is a storage round-trip) so a 150-hash
 	// batch doesn't take ~24s and make the client drop the whole thing to uncached.
 	fanOut(uncached(), func(hash string) {
-		name, files, ok := h.cachedFiles(ctx, hash)
+		name, files, ok := h.warmCachedFiles(ctx, user.ID, hash)
 		if !ok {
 			return
 		}
@@ -103,7 +103,8 @@ func (h *Handler) checkMagnets(w http.ResponseWriter, r *http.Request, user *aut
 	// Tier 1.5: complete on another node (per-box cache) — the local store can't see it,
 	// so one batched lookup in the shared jobs DB; links route to the job's node.
 	if still := uncached(); len(still) > 0 {
-		if byHash, _ := h.Jobs.CachedByHashes(ctx, still); byHash != nil {
+		if h.Jobs != nil {
+			byHash, _ := h.Jobs.CachedByHashes(ctx, still)
 			mu.Lock()
 			for hash, job := range byHash {
 				if len(job.Files) == 0 {
@@ -113,11 +114,26 @@ func (h *Handler) checkMagnets(w http.ResponseWriter, r *http.Request, user *aut
 				if name == "" {
 					name, _ = items[idxOf[hash]]["name"].(string)
 				}
-				items[idxOf[hash]] = map[string]any{"hash": hash, "magnet": magnet.Build(hash, name), "status": "cached", "name": name, "files": h.buildFileEntries(hash, job.Node, job.Files)}
+				items[idxOf[hash]] = map[string]any{"hash": hash, "magnet": magnet.Build(hash, name), "status": "cached", "name": name, "files": h.buildFileEntries(user.ID, hash, job.Node, job.Files)}
 			}
 			mu.Unlock()
 		}
 	}
+
+	// Tier 1.75: a durable Cairn is immediately playable even when its warm
+	// cache copy was evicted. Prefer local and cross-node warm copies above.
+	fanOut(uncached(), func(hash string) {
+		name, files, ok := h.cairnCachedFiles(ctx, user.ID, hash)
+		if !ok {
+			return
+		}
+		mu.Lock()
+		if name == "" {
+			name, _ = items[idxOf[hash]]["name"].(string)
+		}
+		items[idxOf[hash]] = map[string]any{"hash": hash, "magnet": magnet.Build(hash, name), "status": "cached", "name": name, "files": files}
+		mu.Unlock()
+	})
 
 	// Tier 1b: known release links (hdencode/scene-rls) are fetchable via AD + unrar.
 	// Tier 2: system AD library (torrin's own shared pool), fast DB lookup.

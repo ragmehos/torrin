@@ -19,12 +19,22 @@ import (
 // --- fakes for the handler deps (Store/Bus are interfaces; Jobs is jobs.Repository) ---
 
 type fakeStore struct {
-	has   bool
-	bytes []byte
+	has        bool
+	bytes      []byte
+	hasByKey   map[string]bool
+	bytesByKey map[string][]byte
 }
 
-func (f *fakeStore) Has(context.Context, string) (bool, error) { return f.has, nil }
-func (f *fakeStore) GetBytes(context.Context, string) ([]byte, error) {
+func (f *fakeStore) Has(_ context.Context, key string) (bool, error) {
+	if f.hasByKey != nil {
+		return f.hasByKey[key], nil
+	}
+	return f.has, nil
+}
+func (f *fakeStore) GetBytes(_ context.Context, key string) ([]byte, error) {
+	if b, ok := f.bytesByKey[key]; ok {
+		return b, nil
+	}
 	if f.bytes == nil {
 		return nil, errors.New("not found")
 	}

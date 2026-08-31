@@ -11,9 +11,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/torrin-app/torrin/shared/cairn"
 	"github.com/torrin-app/torrin/shared/crypto"
 	"github.com/torrin-app/torrin/shared/manifest"
 	"github.com/torrin-app/torrin/shared/storage"
+	sharedusenet "github.com/torrin-app/torrin/shared/usenet"
 )
 
 var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 256*1024); return &b }}
@@ -34,20 +36,39 @@ type Storage interface {
 	Verify(path string, expires int64, userID, sig string) bool
 }
 
+type CairnStore interface {
+	GetBytes(ctx context.Context, key string) ([]byte, error)
+}
+
 type Server struct {
-	store    Storage
-	cors     string
-	apiURL   string
-	view     *http.Client
-	zips     *zipGuard
-	byos     *byosBackend
-	cipher   *crypto.Stream
-	nodeOf   func(ctx context.Context, ih string) string
-	nodeSeen sync.Map
+	store      Storage
+	cors       string
+	apiURL     string
+	view       *http.Client
+	zips       *zipGuard
+	byos       *byosBackend
+	cairnStore CairnStore
+	cairnFetch sharedusenet.ArticleFetcher
+	cairnSlots *streamGuard
+	cipher     *crypto.Stream
+	nodeOf     func(ctx context.Context, ih string) string
+	nodeSeen   sync.Map
 }
 
 func New(store Storage, corsOrigin, apiURL string, cipher *crypto.Stream) *Server {
-	return &Server{store: store, cors: corsOrigin, apiURL: apiURL, view: &http.Client{Timeout: 5 * time.Second}, zips: newZipGuard(maxZipsPerUser), cipher: cipher}
+	return &Server{
+		store: store, cors: corsOrigin, apiURL: apiURL,
+		view: &http.Client{Timeout: 5 * time.Second}, zips: newZipGuard(maxZipsPerUser),
+		cairnSlots: newStreamGuard(20, 2), cipher: cipher,
+	}
+}
+
+func (s *Server) SetCairn(store CairnStore, fetcher sharedusenet.ArticleFetcher) {
+	s.cairnStore, s.cairnFetch = store, fetcher
+}
+
+func (s *Server) SetCairnLimits(total, perUser int) {
+	s.cairnSlots = newStreamGuard(total, perUser)
 }
 
 func (s *Server) SetNodeResolver(fn func(ctx context.Context, ih string) string) { s.nodeOf = fn }
@@ -105,6 +126,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.store.Verify(key, expNum, user, sig) {
 		httpError(w, 403, "invalid signature")
+		return
+	}
+	if _, _, _, ok := cairn.ParseStreamPath(key); ok {
+		s.serveCairn(w, r, key)
 		return
 	}
 

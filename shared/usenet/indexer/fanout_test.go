@@ -25,11 +25,12 @@ func TestFanOutMergesAndTags(t *testing.T) {
 }
 
 func TestFanOutToleratesFailure(t *testing.T) {
-	calls := 0
-	sources := []Source{{ID: "ok"}, {ID: "dead"}}
+	sources := []Source{
+		{ID: "ok", Client: NewTestClient("http://ok", "k")},
+		{ID: "dead", Client: NewTestClient("http://dead", "k")},
+	}
 	got := FanOut(context.Background(), sources, time.Second, func(c *Client) ([]Result, error) {
-		calls++
-		if calls == 2 {
+		if c.BaseURL() == "http://dead" {
 			return nil, errors.New("boom")
 		}
 		return []Result{{Title: "y"}}, nil

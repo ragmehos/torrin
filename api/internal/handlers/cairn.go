@@ -2,17 +2,30 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/torrin-app/torrin/api/internal/middleware"
 	"github.com/torrin-app/torrin/api/internal/web"
 	"github.com/torrin-app/torrin/shared/auth"
+	"github.com/torrin-app/torrin/shared/cairn"
 	"github.com/torrin-app/torrin/shared/events"
+	"github.com/torrin-app/torrin/shared/georoute"
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/manifest"
 	"github.com/torrin-app/torrin/shared/plans"
+	"github.com/torrin-app/torrin/shared/usenet/nzb"
 )
+
+type cairnListItem struct {
+	auth.CairnItem
+	Cached       bool          `json:"cached"`
+	StreamSource string        `json:"stream_source,omitempty"`
+	StreamURLs   []jobs.Stream `json:"stream_urls,omitempty"`
+}
 
 func canCairn(plan plans.Plan, user *auth.User) bool {
 	return plan.ID != "free" && user.Recurrence != "days"
@@ -44,7 +57,7 @@ func (s *Server) cairnCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, _, archived := s.Users.GetCairnArchive(r.Context(), hash)
+	_, _, archived := s.Cairns.GetCairnArchive(r.Context(), hash)
 	node := ""
 	if !archived {
 		job, err := s.Jobs.GetByInfoHash(r.Context(), hash)
@@ -54,7 +67,7 @@ func (s *Server) cairnCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		node = job.Node
 	}
-	if err := s.Users.AddUserCairn(r.Context(), user.ID, hash); err != nil {
+	if err := s.Cairns.AddUserCairn(r.Context(), user.ID, hash); err != nil {
 		web.WriteError(w, 500, "failed to save cairn")
 		return
 	}
@@ -70,19 +83,94 @@ func (s *Server) cairnCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cairnList(w http.ResponseWriter, r *http.Request) {
-	items, err := s.Users.ListUserCairns(r.Context(), middleware.GetUser(r).ID)
+	user := middleware.GetUser(r)
+	items, err := s.Cairns.ListUserCairns(r.Context(), user.ID)
 	if err != nil {
 		web.WriteError(w, 500, "failed to list cairns")
 		return
 	}
-	web.WriteJSON(w, 200, map[string]any{"cairns": items})
+	out := make([]cairnListItem, len(items))
+	for i, item := range items {
+		out[i].CairnItem = item
+		if streams, ok := s.cachedCairnStreams(r, user.ID, item.InfoHash); ok {
+			out[i].Cached, out[i].StreamSource, out[i].StreamURLs = true, "cache", streams
+			continue
+		}
+		if !item.Archived || !s.CairnDirect {
+			continue
+		}
+		streams, err := s.directCairnStreams(r, user.ID, item.InfoHash)
+		if err != nil {
+			slog.Warn("cairn: direct streams unavailable", "hash", item.InfoHash, "err", err)
+			continue
+		}
+		out[i].Cached, out[i].StreamSource, out[i].StreamURLs = true, "cairn", streams
+	}
+	web.WriteJSON(w, 200, map[string]any{"cairns": out})
+}
+
+func (s *Server) cachedCairnStreams(r *http.Request, userID, hash string) ([]jobs.Stream, bool) {
+	if !manifest.Playable(r.Context(), s.Store, hash) {
+		return nil, false
+	}
+	data, err := s.Store.GetBytes(r.Context(), manifest.Path(hash))
+	if err != nil {
+		return nil, false
+	}
+	man, err := manifest.Parse(data)
+	if err != nil || len(man.Files) == 0 {
+		return nil, false
+	}
+	files := make([]jobs.File, len(man.Files))
+	for i, f := range man.Files {
+		files[i] = jobs.File{Index: i, Name: f.FileName, Size: f.FileSize, Key: f.DirectURL, Enc: f.Enc}
+	}
+	job := &jobs.Job{UserID: userID, InfoHash: hash, Node: s.Jobs.NodeForInfoHash(r.Context(), hash), Files: files}
+	return s.signStreams(job, r), true
+}
+
+func (s *Server) directCairnStreams(r *http.Request, userID, hash string) ([]jobs.Stream, error) {
+	data, err := s.CairnStore.GetBytes(r.Context(), nzb.StorageKey(hash))
+	if err != nil {
+		if fallback, ok := s.Cairns.GetCairnNZB(r.Context(), hash); ok {
+			data, err = fallback, nil
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read nzb: %w", err)
+	}
+	parsed, err := nzb.ParseBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse nzb: %w", err)
+	}
+	if len(parsed.Files) == 0 {
+		return nil, fmt.Errorf("parse nzb: no files")
+	}
+	streams := make([]jobs.Stream, len(parsed.Files))
+	for i, file := range parsed.Files {
+		name := file.Filename
+		if name == "" {
+			name = file.Subject
+		}
+		size := file.Size()
+		enc := s.CairnCipher != nil
+		if enc {
+			size, err = s.CairnCipher.PlainSize(size)
+			if err != nil {
+				return nil, fmt.Errorf("file %d encrypted size: %w", i, err)
+			}
+		}
+		u := s.Store.SignURLNodeUser("", cairn.StreamPath(hash, i, name), userID, 24*time.Hour) + manifest.StreamQuery(hash, enc)
+		streams[i] = jobs.Stream{FileName: name, Size: size, SignedURL: georoute.URL(r, u)}
+	}
+	return streams, nil
 }
 
 func (s *Server) cairnRestore(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
 	plan := middleware.GetPlan(r)
 	hash := strings.ToLower(strings.TrimSpace(r.PathValue("hash")))
-	_, name, ok := s.Users.GetCairnArchive(r.Context(), hash)
+	_, name, ok := s.Cairns.GetCairnArchive(r.Context(), hash)
 	if !ok {
 		web.WriteError(w, 404, "no cairn archive for this item")
 		return
@@ -122,7 +210,7 @@ func (s *Server) cairnRestore(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) cairnDelete(w http.ResponseWriter, r *http.Request) {
 	hash := strings.ToLower(strings.TrimSpace(r.PathValue("hash")))
-	if err := s.Users.DeleteUserCairn(r.Context(), middleware.GetUser(r).ID, hash); err != nil {
+	if err := s.Cairns.DeleteUserCairn(r.Context(), middleware.GetUser(r).ID, hash); err != nil {
 		web.WriteError(w, 500, "failed to remove cairn")
 		return
 	}

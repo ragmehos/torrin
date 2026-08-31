@@ -16,6 +16,7 @@ import (
 	"github.com/torrin-app/torrin/shared/availcache"
 	"github.com/torrin-app/torrin/shared/billing"
 	"github.com/torrin-app/torrin/shared/bus"
+	"github.com/torrin-app/torrin/shared/crypto"
 	"github.com/torrin-app/torrin/shared/email"
 	"github.com/torrin-app/torrin/shared/env"
 	"github.com/torrin-app/torrin/shared/jobs"
@@ -57,6 +58,11 @@ func main() {
 	}
 
 	store.SetNodeBases(parseNodeBases(env.Get("NODE_STREAM_BASES", "")))
+	cairnStore := service.CairnStore()
+	cairnCipher, err := crypto.NewStream(env.Get("STORAGE_KEY", ""))
+	if err != nil {
+		fatal("cairn stream key", err)
+	}
 
 	b, err := bus.Connect(mustEnv("NATS_URL"))
 	if err != nil {
@@ -100,7 +106,8 @@ func main() {
 		env.Get("API_PUBLIC_URL", ""), env.Get("WEB_URL", ""),
 		env.Get("DONATION_DISCORD_WEBHOOK", ""), users)
 	srv := handlers.New(handlers.Deps{
-		Jobs: jobsRepo, JobsPG: jobsRepo, Users: users, Store: store, Bus: b,
+		Jobs: jobsRepo, JobsPG: jobsRepo, Users: users, Store: store, CairnStore: cairnStore, CairnCipher: cairnCipher,
+		CairnDirect: env.Get("USENET_HOST", "") != "", Bus: b,
 		Slots: slots, Qbit: qb, QbitSeed: qbSeed, Scrape: scrape.New(), Mailer: mailer, Budget: budget,
 		RClone: rc, Bitcart: bitcart, Bachs: bachs, SignKey: []byte(env.Get("SIGNING_KEY", "")),
 		SeedingEnabled:    env.Get("SEEDING_ENABLED", "") == "true",
@@ -133,7 +140,8 @@ func main() {
 		tc.SetCache(avail)
 	}
 	stremthru.New(stremthru.Deps{
-		Users: users, Jobs: jobsRepo, Store: store, Slots: slots, Bus: b,
+		Users: users, Jobs: jobsRepo, Store: store, Cairns: users, CairnStore: cairnStore,
+		CairnCipher: cairnCipher, CairnDirect: env.Get("USENET_HOST", "") != "", Slots: slots, Bus: b,
 		TC: tc, Qbit: qb, SysADKey: env.Get("AD_API_KEY", ""), SysRDKey: env.Get("RD_API_KEY", ""),
 	}).Register(mux)
 

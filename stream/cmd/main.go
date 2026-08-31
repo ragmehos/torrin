@@ -11,6 +11,7 @@ import (
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/rclonerc"
 	"github.com/torrin-app/torrin/shared/service"
+	"github.com/torrin-app/torrin/shared/usenet/download"
 	"github.com/torrin-app/torrin/stream/internal/server"
 )
 
@@ -35,6 +36,38 @@ func main() {
 		slog.Error("storage key", "err", err)
 	}
 	srv := server.New(store, env.Get("CORS_ORIGIN", "*"), env.Get("API_URL", ""), cipher)
+	cairnStore := service.CairnStore()
+	if cairnStore == nil {
+		cairnStore = store
+	}
+	srv.SetCairn(cairnStore, nil)
+	if host := env.Get("USENET_HOST", ""); host != "" {
+		maxConns := int(env.Int("USENET_MAXCONNS", 20))
+		if maxConns < 1 {
+			maxConns = 20
+		}
+		maxPerUser := int(env.Int("CAIRN_STREAM_MAX_PER_USER", 2))
+		if maxPerUser < 1 {
+			maxPerUser = 2
+		}
+		if maxPerUser > maxConns {
+			maxPerUser = maxConns
+		}
+		srv.SetCairnLimits(maxConns, maxPerUser)
+		pool, release, poolErr := download.AcquireShared(download.Credentials{
+			Host: host, Port: int(env.Int("USENET_PORT", 563)),
+			Username: env.Get("USENET_USER", ""), Password: env.Get("USENET_PASS", ""),
+			SSL: env.Get("USENET_SSL", "true") != "false", MaxConns: maxConns,
+		})
+		if poolErr != nil {
+			slog.Warn("stream: cairn usenet disabled", "err", poolErr)
+		} else {
+			defer release()
+			srv.SetCairn(cairnStore, download.NewArticleFetcher(pool))
+			slog.Info("stream serving cairn archives from usenet", "host", host,
+				"max_streams", maxConns, "max_per_user", maxPerUser)
+		}
+	}
 
 	if dsn, rcURL := env.Get("DATABASE_URL", ""), env.Get("RCLONE_RC_URL", ""); dsn != "" && rcURL != "" {
 		users, uErr := auth.NewPostgres(context.Background(), dsn)

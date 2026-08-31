@@ -9,6 +9,7 @@ import (
 	"github.com/torrin-app/torrin/api/internal/middleware"
 	"github.com/torrin-app/torrin/shared/auth"
 	"github.com/torrin-app/torrin/shared/billing"
+	"github.com/torrin-app/torrin/shared/crypto"
 	"github.com/torrin-app/torrin/shared/email"
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/providers"
@@ -33,22 +34,38 @@ type Publisher interface {
 	Publish(subject string, v any) error
 }
 
+type CairnRepository interface {
+	GetCairnArchive(ctx context.Context, infoHash string) (nzbKey, name string, ok bool)
+	GetCairnNZB(ctx context.Context, infoHash string) ([]byte, bool)
+	AddUserCairn(ctx context.Context, userID, infoHash string) error
+	DeleteUserCairn(ctx context.Context, userID, infoHash string) error
+	ListUserCairns(ctx context.Context, userID string) ([]auth.CairnItem, error)
+}
+
+type CairnStore interface {
+	GetBytes(ctx context.Context, key string) ([]byte, error)
+}
+
 type Deps struct {
-	Jobs     jobs.Repository
-	JobsPG   *jobs.Postgres
-	Users    *auth.Store
-	Store    Storage
-	Bus      Publisher
-	Slots    *middleware.SlotTracker
-	Qbit     *qbit.Client
-	QbitSeed *qbit.Client
-	Scrape   *scrape.Client
-	Mailer   *email.Client
-	RClone   *rclonerc.Client
-	Bitcart  *billing.BitcartHandler
-	Bachs    *billing.BachsHandler
-	SignKey  []byte
-	Budget   int64
+	Jobs        jobs.Repository
+	JobsPG      *jobs.Postgres
+	Users       *auth.Store
+	Cairns      CairnRepository
+	Store       Storage
+	CairnStore  CairnStore
+	CairnCipher *crypto.Stream
+	CairnDirect bool
+	Bus         Publisher
+	Slots       *middleware.SlotTracker
+	Qbit        *qbit.Client
+	QbitSeed    *qbit.Client
+	Scrape      *scrape.Client
+	Mailer      *email.Client
+	RClone      *rclonerc.Client
+	Bitcart     *billing.BitcartHandler
+	Bachs       *billing.BachsHandler
+	SignKey     []byte
+	Budget      int64
 
 	SeedingEnabled    bool
 	SeedingAllowUsers map[string]bool
@@ -74,7 +91,15 @@ type Server struct {
 	Deps
 }
 
-func New(d Deps) *Server { return &Server{d} }
+func New(d Deps) *Server {
+	if d.Cairns == nil {
+		d.Cairns = d.Users
+	}
+	if d.CairnStore == nil {
+		d.CairnStore = d.Store
+	}
+	return &Server{d}
+}
 
 func (s *Server) Register(mux *http.ServeMux, authMW func(http.Handler) http.Handler) {
 	loginMW := func(h http.Handler) http.Handler { return authMW(middleware.RequireSession(s.SignKey)(h)) }

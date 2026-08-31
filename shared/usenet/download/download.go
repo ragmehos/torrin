@@ -112,6 +112,22 @@ type Result struct {
 	Size int64
 }
 
+// ArticleFetcher retrieves a raw article body. Keeping this boundary small
+// lets seekable readers and the bulk downloader share the NNTP retry policy.
+type ArticleFetcher interface {
+	Fetch(ctx context.Context, msgID, group string) ([]byte, error)
+}
+
+type poolArticleFetcher struct{ pool nntpPool.ConnectionPool }
+
+func NewArticleFetcher(pool nntpPool.ConnectionPool) ArticleFetcher {
+	return poolArticleFetcher{pool: pool}
+}
+
+func (f poolArticleFetcher) Fetch(ctx context.Context, msgID, group string) ([]byte, error) {
+	return fetchSegment(ctx, f.pool, msgID, group)
+}
+
 func TestCredentials(ctx context.Context, c Credentials) error {
 	pool, err := NewPool(c)
 	if err != nil {
@@ -136,6 +152,7 @@ func Download(ctx context.Context, pool nntpPool.ConnectionPool, n *nzb.NZB, out
 	total := n.TotalSize()
 	var done, totalMissing int64
 	var results []Result
+	fetcher := NewArticleFetcher(pool)
 
 	for _, file := range n.Files {
 		name := filepath.Base(FileName(file))
@@ -151,7 +168,7 @@ func Download(ctx context.Context, pool nntpPool.ConnectionPool, n *nzb.NZB, out
 		if err != nil {
 			return nil, 0, err
 		}
-		missing, err := downloadFile(ctx, pool, file, group, f, &done, total, conns, onProgress)
+		missing, err := downloadFile(ctx, fetcher, file, group, f, &done, total, conns, onProgress)
 		f.Sync()
 		f.Close()
 		if err != nil {
@@ -181,7 +198,7 @@ func isOptional(name string) bool {
 		strings.HasSuffix(l, ".txt") || strings.HasSuffix(l, ".jpg") || strings.HasSuffix(l, ".png")
 }
 
-func downloadFile(ctx context.Context, pool nntpPool.ConnectionPool, file nzb.File, group string, f *os.File, done *int64, total int64, conns int, onProgress func(done, total int64)) (int64, error) {
+func downloadFile(ctx context.Context, fetcher ArticleFetcher, file nzb.File, group string, f *os.File, done *int64, total int64, conns int, onProgress func(done, total int64)) (int64, error) {
 	sem := make(chan struct{}, conns)
 	var wg sync.WaitGroup
 	var fatal error
@@ -197,7 +214,7 @@ func downloadFile(ctx context.Context, pool nntpPool.ConnectionPool, file nzb.Fi
 			if ctx.Err() != nil {
 				return
 			}
-			data, err := fetchSegment(ctx, pool, seg.MessageID, group)
+			data, err := fetcher.Fetch(ctx, seg.MessageID, group)
 			if err == nil {
 				var dec *decoder.YencResult
 				if dec, err = decoder.Decode(data); err == nil {
@@ -242,7 +259,7 @@ func fetchSegment(ctx context.Context, pool nntpPool.ConnectionPool, msgID, grou
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		conn, err := pool.Get(ctx)
+		conn, err := getPoolConn(ctx, pool)
 		if err != nil {
 			lastErr = err
 			continue
@@ -274,6 +291,35 @@ func fetchSegment(ctx context.Context, pool nntpPool.ConnectionPool, msgID, grou
 		return data, nil
 	}
 	return nil, failure.Wrap(failure.Interrupted, "segment %s after %d attempts: %v", msgID, segAttempts, lastErr)
+}
+
+type poolConnResult struct {
+	conn *nntpPool.NNTPConn
+	err  error
+}
+
+func getPoolConn(ctx context.Context, pool nntpPool.ConnectionPool) (*nntpPool.NNTPConn, error) {
+	result := make(chan poolConnResult)
+	abandoned := make(chan struct{})
+	go func() {
+		// nntpPool closes the entire shared pool when the context passed to Get
+		// is canceled. Detach that call, while letting this request stop waiting.
+		conn, err := pool.Get(context.WithoutCancel(ctx))
+		select {
+		case result <- poolConnResult{conn: conn, err: err}:
+		case <-abandoned:
+			if conn != nil {
+				pool.Put(conn)
+			}
+		}
+	}()
+	select {
+	case out := <-result:
+		return out.conn, out.err
+	case <-ctx.Done():
+		close(abandoned)
+		return nil, ctx.Err()
+	}
 }
 
 // isArticleMissing reports whether the article is genuinely absent (NNTP 430/423)

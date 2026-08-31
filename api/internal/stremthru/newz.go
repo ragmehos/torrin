@@ -40,7 +40,7 @@ func (h *Handler) checkNewz(w http.ResponseWriter, r *http.Request, user *auth.U
 	for _, hh := range hashes {
 		item := map[string]any{"hash": hh, "status": "unknown", "files": []any{}}
 		if ch, ok := mapped[hh]; ok {
-			if _, files, cached := h.cachedFiles(r.Context(), ch); cached {
+			if _, files, cached := h.cachedFiles(r.Context(), user.ID, ch); cached {
 				item["status"] = "cached"
 				item["files"] = files
 			}
@@ -90,7 +90,7 @@ func (h *Handler) getNewz(w http.ResponseWriter, r *http.Request, user *auth.Use
 		stError(w, 404, "not found")
 		return
 	}
-	name, files, cached := h.cachedFiles(r.Context(), contentHash)
+	name, files, cached := h.cachedFiles(r.Context(), user.ID, contentHash)
 	if !cached {
 		files = []map[string]any{}
 	}

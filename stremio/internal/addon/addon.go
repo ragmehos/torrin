@@ -199,6 +199,7 @@ func entry(title, streamURL, infoHash string, size int64) map[string]any {
 	return map[string]any{
 		"name":          "Torrin",
 		"title":         filename,
+		"description":   filename,
 		"url":           streamURL,
 		"behaviorHints": hints,
 	}

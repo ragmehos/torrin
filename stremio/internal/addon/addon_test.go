@@ -72,6 +72,9 @@ func TestEntryIncludesPlaybackHints(t *testing.T) {
 	if got["title"] != "Show.S05E01.MKV" {
 		t.Fatalf("title = %v, want base filename", got["title"])
 	}
+	if got["description"] != "Show.S05E01.MKV" {
+		t.Fatalf("description = %v, want base filename", got["description"])
+	}
 	hints := got["behaviorHints"].(map[string]any)
 	if hints["filename"] != "Show.S05E01.MKV" {
 		t.Errorf("filename = %v", hints["filename"])

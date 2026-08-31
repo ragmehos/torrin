@@ -176,7 +176,16 @@ func coldPullBlocked(ctx context.Context, c coldPullChecker, userID string, perH
 func displayName(m string) string { return magnet.DisplayName(m) }
 
 func sameStreamTarget(j *jobs.Job, id stremioid.ID) bool {
-	return !id.IsEpisode() || j.IMDBID == id.IMDBID && j.Season == id.Season && j.Episode == id.Episode
+	if id.IMDBID == "" {
+		return true
+	}
+	if j.IMDBID != "" && j.IMDBID != id.IMDBID {
+		return false
+	}
+	if id.IsEpisode() {
+		return j.IMDBID == id.IMDBID && j.Season == id.Season && j.Episode == id.Episode
+	}
+	return j.Season == 0 && j.Episode == 0
 }
 
 func reusableStreamJob(candidates []*jobs.Job, userID string, id stremioid.ID) *jobs.Job {
@@ -194,8 +203,6 @@ func reusableStreamJob(candidates []*jobs.Job, userID string, id stremioid.ID) *
 func applyStreamTarget(j *jobs.Job, id stremioid.ID) {
 	if id.IMDBID != "" {
 		j.IMDBID = id.IMDBID
-	}
-	if id.IsEpisode() {
 		j.Season = id.Season
 		j.Episode = id.Episode
 	}

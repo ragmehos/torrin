@@ -1,9 +1,9 @@
 package jobs
 
 import (
-	"strings"
+	"slices"
 
-	tnp "github.com/torrin-app/torrent-name-parser"
+	ptt "github.com/MunifTanjim/go-ptt"
 )
 
 // MatchesEpisodeFile applies job metadata when it is available, but prefers
@@ -11,30 +11,25 @@ import (
 // seekable while preventing one episode request from returning every file in
 // the pack.
 func MatchesEpisodeFile(j *Job, fileName string, season, episode int) bool {
-	if season <= 0 || episode <= 0 {
+	if season < 0 || episode <= 0 {
 		return true
 	}
-	if j != nil && j.Season > 0 && j.Season != season {
-		return false
-	}
 
-	info, err := tnp.ParseName(strings.ReplaceAll(fileName, ".", " "))
-	if err == nil && info.Episode > 0 {
-		if info.Episode != episode {
+	info := ptt.Parse(fileName)
+	if info.Error() == nil && len(info.Episodes) > 0 {
+		if !slices.Contains(info.Episodes, episode) {
 			return false
 		}
 		if len(info.Seasons) == 0 {
+			if j != nil && (j.Season > 0 || j.Episode > 0) {
+				return j.Season == season
+			}
 			return season == 1
 		}
-		for _, fileSeason := range info.Seasons {
-			if fileSeason == season {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(info.Seasons, season)
 	}
 
-	return j != nil && j.Episode == episode && (j.Season == 0 || j.Season == season)
+	return j != nil && j.Season == season && j.Episode == episode
 }
 
 // FilesForEpisode returns the matching files with stable original indexes.

@@ -136,8 +136,14 @@ func TestSameStreamTarget(t *testing.T) {
 	if sameStreamTarget(j, stremioid.Parse("tt9999999:5:1")) {
 		t.Fatal("another title needs a distinct linked job")
 	}
-	if !sameStreamTarget(j, stremioid.Parse("tt3121722")) {
-		t.Fatal("movie-style requests keep existing reuse behavior")
+	if sameStreamTarget(j, stremioid.Parse("tt3121722")) {
+		t.Fatal("movie requests must not inherit an episode-scoped job")
+	}
+	if !sameStreamTarget(&jobs.Job{IMDBID: "3121722"}, stremioid.Parse("tt3121722")) {
+		t.Fatal("movie requests should reuse an unscoped job")
+	}
+	if !sameStreamTarget(j, stremioid.ID{}) {
+		t.Fatal("requests without a Stremio target keep existing reuse behavior")
 	}
 }
 
@@ -146,6 +152,14 @@ func TestApplyStreamTarget(t *testing.T) {
 	applyStreamTarget(j, stremioid.Parse("tt3121722:5:1"))
 	if j.IMDBID != "3121722" || j.Season != 5 || j.Episode != 1 {
 		t.Fatalf("target = imdb %q S%02dE%02d", j.IMDBID, j.Season, j.Episode)
+	}
+}
+
+func TestApplyMovieTargetClearsEpisodeScope(t *testing.T) {
+	j := &jobs.Job{IMDBID: "old", Season: 12, Episode: 3}
+	applyStreamTarget(j, stremioid.Parse("tt0816692"))
+	if j.IMDBID != "0816692" || j.Season != 0 || j.Episode != 0 {
+		t.Fatalf("movie target = imdb %q S%02dE%02d", j.IMDBID, j.Season, j.Episode)
 	}
 }
 

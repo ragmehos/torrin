@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -69,6 +71,10 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 
 	byos := s.userHasBYOS(r.Context(), user.ID)
 	id := stremioid.Parse(contentID)
+	if !streamTargetMatchesType(r.PathValue("type"), id) {
+		writeJSON(w, 200, empty)
+		return
+	}
 	var streams []map[string]any
 	if id.InfoHash != "" {
 		streams = append(streams, s.byHash(r, id.InfoHash, user.ID, byos)...)
@@ -100,7 +106,7 @@ func (s *Server) byHash(r *http.Request, infoHash, userID string, byos bool) []m
 	}
 	var out []map[string]any
 	for _, f := range man.Files {
-		out = append(out, entry(f.FileName, s.streamURL(r, infoHash, f.DirectURL, userID, byos, f.Enc)))
+		out = append(out, entry(f.FileName, s.streamURL(r, infoHash, f.DirectURL, userID, byos, f.Enc), infoHash, f.FileSize))
 	}
 	return out
 }
@@ -137,7 +143,7 @@ func (s *Server) byLibrary(r *http.Request, contentType string, id stremioid.ID,
 			seen[j.InfoHash] = true
 			for _, f := range files {
 				key := manifest.ResolveKey(j.InfoHash, f.Index, f.Key, f.Name)
-				out = append(out, entry(f.Name, s.streamURL(r, j.InfoHash, key, userID, byos, f.Enc)))
+				out = append(out, entry(f.Name, s.streamURL(r, j.InfoHash, key, userID, byos, f.Enc), j.InfoHash, f.Size))
 			}
 		}
 	}
@@ -163,14 +169,38 @@ func libraryFiles(j *jobs.Job, id stremioid.ID) []jobs.File {
 	return jobs.FilesForEpisode(j, j.Files, id.Season, id.Episode)
 }
 
-func entry(title, url string) map[string]any {
+func streamTargetMatchesType(contentType string, id stremioid.ID) bool {
+	if id.InfoHash != "" {
+		return contentType == "movie" || contentType == "series"
+	}
+	switch contentType {
+	case "movie":
+		return id.IMDBID != "" && !id.IsEpisode()
+	case "series":
+		return id.IsEpisode()
+	default:
+		return false
+	}
+}
+
+func entry(title, streamURL, infoHash string, size int64) map[string]any {
+	filename := path.Base(strings.ReplaceAll(title, `\`, "/"))
+	parsedURL, _ := url.Parse(streamURL)
+	hints := map[string]any{
+		"filename":    filename,
+		"notWebReady": parsedURL.Scheme != "https" || !strings.EqualFold(path.Ext(filename), ".mp4"),
+	}
+	if infoHash != "" {
+		hints["bingeGroup"] = "torrin:" + strings.ToLower(infoHash)
+	}
+	if size > 0 {
+		hints["videoSize"] = size
+	}
 	return map[string]any{
-		"name":  "Torrin",
-		"title": title,
-		"url":   url,
-		"behaviorHints": map[string]any{
-			"notWebReady": strings.HasSuffix(title, ".mkv"),
-		},
+		"name":          "Torrin",
+		"title":         filename,
+		"url":           streamURL,
+		"behaviorHints": hints,
 	}
 }
 

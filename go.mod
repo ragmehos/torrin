@@ -3,6 +3,7 @@ module github.com/torrin-app/torrin
 go 1.25.0
 
 require (
+	github.com/MunifTanjim/go-ptt v0.14.0
 	github.com/PuerkitoBio/goquery v1.11.0
 	github.com/Tensai75/nntpPool v0.1.3
 	github.com/Tensai75/nzbparser v0.1.0

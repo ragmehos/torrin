@@ -43,11 +43,12 @@ func TestVerify(t *testing.T) {
 
 	eps := []Result{
 		{Title: "Silo.S01E02.Holstons.Pick.2160p.ATVP.WEB-DL.H.265-NTb"},
+		{Title: "Silo.S01E01-E03.2160p.ATVP.WEB-DL.H.265-NTb"},
 		{Title: "Silo.S01E03.Machine.2160p.ATVP.WEB-DL.H.265-NTb"},
 		{Title: "Silo.Law.S01E02.1080p.WEB.h264-EDITH"},
 	}
 	got = Verify(eps, "", "Silo", 1, 2)
-	if len(got) != 1 || got[0].Title != eps[0].Title {
+	if len(got) != 2 || got[0].Title != eps[0].Title || got[1].Title != eps[1].Title {
 		t.Fatalf("episode verify: got %+v", got)
 	}
 }

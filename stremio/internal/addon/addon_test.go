@@ -32,6 +32,70 @@ func TestLibraryFilesDoesNotReturnWrongSeasonPack(t *testing.T) {
 	}
 }
 
+func TestLibraryFilesDoesNotFilterMovies(t *testing.T) {
+	j := &jobs.Job{Files: []jobs.File{
+		{Name: "Movie.2024.mkv"},
+		{Name: "Movie.behind-the-scenes.mkv"},
+	}}
+	got := libraryFiles(j, stremioid.Parse("tt0816692"))
+	if len(got) != len(j.Files) {
+		t.Fatalf("movie files = %d, want %d", len(got), len(j.Files))
+	}
+}
+
+func TestStreamTargetMatchesType(t *testing.T) {
+	tests := []struct {
+		contentType string
+		contentID   string
+		want        bool
+	}{
+		{contentType: "movie", contentID: "tt0816692", want: true},
+		{contentType: "series", contentID: "tt3121722:5:1", want: true},
+		{contentType: "series", contentID: "tt3121722:0:2", want: true},
+		{contentType: "series", contentID: "tt3121722"},
+		{contentType: "movie", contentID: "tt3121722:5:1"},
+		{contentType: "series", contentID: "tt3121722:bad:1"},
+		{contentType: "other", contentID: "tt0816692"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.contentType+"/"+tt.contentID, func(t *testing.T) {
+			if got := streamTargetMatchesType(tt.contentType, stremioid.Parse(tt.contentID)); got != tt.want {
+				t.Fatalf("streamTargetMatchesType() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEntryIncludesPlaybackHints(t *testing.T) {
+	hash := "C12FE1C06BBA254A9DC9F519B335AA7C1367A88A"
+	got := entry(`Show\Season 05\Show.S05E01.MKV`, "https://stream.example/file", hash, 1234)
+	if got["title"] != "Show.S05E01.MKV" {
+		t.Fatalf("title = %v, want base filename", got["title"])
+	}
+	hints := got["behaviorHints"].(map[string]any)
+	if hints["filename"] != "Show.S05E01.MKV" {
+		t.Errorf("filename = %v", hints["filename"])
+	}
+	if hints["notWebReady"] != true {
+		t.Errorf("notWebReady = %v, want true for MKV", hints["notWebReady"])
+	}
+	if hints["bingeGroup"] != "torrin:c12fe1c06bba254a9dc9f519b335aa7c1367a88a" {
+		t.Errorf("bingeGroup = %v", hints["bingeGroup"])
+	}
+	if hints["videoSize"] != int64(1234) {
+		t.Errorf("videoSize = %v", hints["videoSize"])
+	}
+
+	mp4 := entry("movie.MP4", "https://stream.example/file", hash, 0)
+	mp4Hints := mp4["behaviorHints"].(map[string]any)
+	if mp4Hints["notWebReady"] != false {
+		t.Errorf("HTTPS MP4 notWebReady = %v, want false", mp4Hints["notWebReady"])
+	}
+	if _, ok := mp4Hints["videoSize"]; ok {
+		t.Error("unknown video size should be omitted")
+	}
+}
+
 func TestManifest(t *testing.T) {
 	w := httptest.NewRecorder()
 	(&Server{}).manifest(w, httptest.NewRequest(http.MethodGet, "/key/manifest.json", nil))

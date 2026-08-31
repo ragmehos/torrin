@@ -9,7 +9,7 @@ import (
 func TestEpisodeMatch(t *testing.T) {
 	tagged := &jobs.Job{Season: 2, Episode: 5}
 	if !episodeMatch(tagged, "whatever_garbage_name.mkv", 2, 5) {
-		t.Error("tagged job trusts its stored season/episode regardless of filename")
+		t.Error("tagged job should fall back to stored season/episode for an opaque filename")
 	}
 	if episodeMatch(tagged, "whatever_garbage_name.mkv", 1, 5) {
 		t.Error("tagged job for s2e5 must not match s1e5")

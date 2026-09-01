@@ -220,7 +220,7 @@ func TestByHashFallsBackToCrossNodeWarm(t *testing.T) {
 		store: fakeStreamStore{err: errors.New("local manifest missing")},
 	}
 	r := httptest.NewRequest(http.MethodGet, "/stream/movie/"+hash, nil)
-	link := streamLink(t, s.byHash(r, hash, "user-3", false))
+	link := streamLink(t, s.byHash(r, hash, "user-3"))
 	if !strings.Contains(link, "node://box3/blobs/movie") {
 		t.Fatalf("cross-node hash link = %q", link)
 	}
@@ -236,7 +236,7 @@ func TestByHashFallsBackToUserBoundCairn(t *testing.T) {
 		store: fakeStreamStore{err: errors.New("local manifest missing")},
 	}
 	r := httptest.NewRequest(http.MethodGet, "/stream/movie/"+hash, nil)
-	link := streamLink(t, s.byHash(r, hash, "user-4", false))
+	link := streamLink(t, s.byHash(r, hash, "user-4"))
 	if !strings.Contains(link, hash+"/cairn/0/movie.mkv") || !strings.Contains(link, "?u=user-4") {
 		t.Fatalf("direct hash Cairn link = %q", link)
 	}

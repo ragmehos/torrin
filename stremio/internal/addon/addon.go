@@ -97,7 +97,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	}
 	var streams []map[string]any
 	if id.InfoHash != "" {
-		streams = append(streams, s.byHash(r, id.InfoHash, user.ID, byos)...)
+		streams = append(streams, s.byHash(r, id.InfoHash, user.ID)...)
 	}
 	if id.IMDBID != "" {
 		streams = append(streams, s.byLibrary(r, r.PathValue("type"), id, user.ID, byos)...)
@@ -114,7 +114,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"streams": streams})
 }
 
-func (s *Server) byHash(r *http.Request, infoHash, userID string, _ bool) []map[string]any {
+func (s *Server) byHash(r *http.Request, infoHash, userID string) []map[string]any {
 	data, err := s.store.GetBytes(r.Context(), manifest.Path(infoHash))
 	if err == nil {
 		man, parseErr := manifest.Parse(data)

@@ -7,12 +7,16 @@ import (
 )
 
 func TestEpisodeMatch(t *testing.T) {
-	tagged := &jobs.Job{Season: 2, Episode: 5}
+	tagged := &jobs.Job{Season: 2, Episode: 5, Files: []jobs.File{{Name: "whatever_garbage_name.mkv"}}}
 	if !episodeMatch(tagged, "whatever_garbage_name.mkv", 2, 5) {
-		t.Error("tagged job should fall back to stored season/episode for an opaque filename")
+		t.Error("single-file tagged job should fall back to stored season/episode for an opaque filename")
 	}
 	if episodeMatch(tagged, "whatever_garbage_name.mkv", 1, 5) {
 		t.Error("tagged job for s2e5 must not match s1e5")
+	}
+	pack := &jobs.Job{Season: 2, Episode: 5, Files: []jobs.File{{Name: "opaque_a.mkv"}, {Name: "opaque_b.mkv"}}}
+	if episodeMatch(pack, "opaque_a.mkv", 2, 5) {
+		t.Error("opaque file in a multi-file pack must not match on shared job metadata")
 	}
 	untagged := &jobs.Job{}
 	if !episodeMatch(untagged, "Severance.S01E03.1080p.mkv", 1, 3) {
@@ -20,15 +24,6 @@ func TestEpisodeMatch(t *testing.T) {
 	}
 	if episodeMatch(untagged, "no_episode_here.mkv", 1, 3) {
 		t.Error("untagged job with unparseable name must not match")
-	}
-}
-
-func TestFileMatchesEpisode(t *testing.T) {
-	if !fileMatchesEpisode("Severance.S01E03.1080p.mkv", 1, 3) {
-		t.Error("S01E03 should match s1e3")
-	}
-	if fileMatchesEpisode("Severance.S01E03.1080p.mkv", 2, 3) {
-		t.Error("S01E03 should not match s2e3")
 	}
 }
 

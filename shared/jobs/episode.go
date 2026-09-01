@@ -10,8 +10,10 @@ import (
 // MatchesEpisodeFile applies job metadata when it is available, but prefers
 // explicit episode information in the filename. That keeps season packs
 // seekable while preventing one episode request from returning every file in
-// the pack.
-func MatchesEpisodeFile(j *Job, fileName string, season, episode int) bool {
+// the pack. single reports whether the job holds a single video file; the job
+// metadata fallback is only trustworthy then, since a pack shares one
+// Season/Episode across every file.
+func MatchesEpisodeFile(j *Job, fileName string, season, episode int, single bool) bool {
 	if season < 0 || episode <= 0 {
 		return true
 	}
@@ -30,19 +32,28 @@ func MatchesEpisodeFile(j *Job, fileName string, season, episode int) bool {
 		return slices.Contains(info.Seasons, season)
 	}
 
-	return j != nil && j.Season == season && j.Episode == episode
+	return single && j != nil && j.Season == season && j.Episode == episode
 }
 
 // FilesForEpisode returns the matching files with stable original indexes.
-// Some legacy rows did not persist File.Index, so their slice position is the
-// fallback used by the storage key convention.
+// When a row never persisted File.Index (every index is zero) the slice
+// position is used as the storage-key index; when any index is set they are
+// trusted as-is so a legitimate index 0 is not overwritten.
 func FilesForEpisode(j *Job, files []File, season, episode int) []File {
+	indexed := false
+	for _, f := range files {
+		if f.Index > 0 {
+			indexed = true
+			break
+		}
+	}
+	single := len(files) == 1
 	out := make([]File, 0, len(files))
 	for position, file := range files {
-		if file.Index == 0 && position > 0 {
+		if !indexed {
 			file.Index = position
 		}
-		if MatchesEpisodeFile(j, file.Name, season, episode) {
+		if MatchesEpisodeFile(j, file.Name, season, episode, single) {
 			out = append(out, file)
 		}
 	}

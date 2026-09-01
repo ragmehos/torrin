@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/Tensai75/nntpPool"
+	sharedusenet "github.com/torrin-app/torrin/shared/usenet"
+	"github.com/torrin-app/torrin/shared/usenet/nzb"
 )
 
 type mockNNTPServer struct {
@@ -233,6 +235,39 @@ func TestPoolArticleFetcherAgainstMockNNTP(t *testing.T) {
 		"AUTHINFO USER alice", "AUTHINFO PASS secret", "DATE",
 		"GROUP alt.test", "BODY <part-1>",
 	} {
+		if !strings.Contains(commands, want) {
+			t.Fatalf("missing command %q in:\n%s", want, commands)
+		}
+	}
+	pool.Close()
+	server.close(t)
+}
+
+func TestSeekableReaderAgainstMockNNTP(t *testing.T) {
+	server := newMockNNTPServer(t)
+	host, port := server.addr()
+	pool, err := NewPool(Credentials{
+		Host: host, Port: port, Username: "alice", Password: "secret", MaxConns: 1,
+	})
+	if err != nil {
+		server.close(t)
+		t.Fatal(err)
+	}
+	reader, err := sharedusenet.NewReader(context.Background(), nzb.File{
+		Groups:   []string{"alt.test"},
+		Segments: []nzb.Segment{{MessageID: "part-1", Number: 1, Bytes: 4}},
+	}, NewArticleFetcher([]nntpPool.ConnectionPool{pool}))
+	if err != nil {
+		pool.Close()
+		server.close(t)
+		t.Fatal(err)
+	}
+	buf := make([]byte, 3)
+	if n, err := reader.ReadAt(buf, 1); err != nil || n != len(buf) || string(buf) != "BCD" {
+		t.Fatalf("seekable read: n=%d data=%q err=%v", n, buf, err)
+	}
+	commands := server.commandLog()
+	for _, want := range []string{"GROUP alt.test", "BODY <part-1>"} {
 		if !strings.Contains(commands, want) {
 			t.Fatalf("missing command %q in:\n%s", want, commands)
 		}

@@ -147,6 +147,13 @@ func (p *Postgres) ListByInfoHash(ctx context.Context, infoHash string) ([]*Job,
 func (p *Postgres) CachedByHashes(ctx context.Context, hashes []string) (map[string]*Job, error) {
 	rows, err := p.query(ctx, `SELECT DISTINCT ON (info_hash) `+cols+` FROM jobs
 		WHERE info_hash = ANY($1) AND status IN ('complete','seeding')
+		AND jsonb_typeof(files)='array' AND files<>'[]'::jsonb
+		AND (COALESCE(node,'')<>'' OR NOT EXISTS (
+			SELECT 1 FROM jsonb_array_elements(
+				CASE WHEN jsonb_typeof(files)='array' THEN files ELSE '[]'::jsonb END
+			) AS file
+			WHERE COALESCE(file->>'key','') LIKE '%/cairn/%'
+		))
 		ORDER BY info_hash, created_at DESC`, hashes)
 	if err != nil {
 		return nil, err

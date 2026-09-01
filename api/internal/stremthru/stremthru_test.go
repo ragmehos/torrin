@@ -62,7 +62,9 @@ func (f fakeStore) GetBytes(context.Context, string) ([]byte, error) {
 }
 func (f fakeStore) Put(context.Context, string, io.Reader, string) error { return nil }
 func (f fakeStore) SignURL(path string, _ time.Duration) string          { return "sign://" + path }
-func (f fakeStore) SignURLNode(_, path string, _ time.Duration) string   { return "sign://" + path }
+func (f fakeStore) SignURLNode(node, path string, _ time.Duration) string {
+	return "sign://" + node + "/" + path
+}
 func (f fakeStore) SignURLNodeUser(_, path, userID string, _ time.Duration) string {
 	return "sign://" + path + "?u=" + userID
 }

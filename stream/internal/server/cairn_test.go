@@ -147,6 +147,17 @@ func TestServeCairnAuthorizationAndFailures(t *testing.T) {
 	if w := do(srv, http.MethodGet, cairnURL(hash, 4, ""), nil); w.Code != 404 || len(fetch.calls) != 0 {
 		t.Fatalf("bad index: code=%d fetches=%v", w.Code, fetch.calls)
 	}
+
+	missing := &fakeCairnFetcher{articles: map[string][]byte{}}
+	srv.SetCairn(fakeCairnStore{data: nzbData}, missing)
+	if w := do(srv, http.MethodGet, cairnURL(hash, 0, ""), nil); w.Code != http.StatusBadGateway || len(missing.calls) != 1 {
+		t.Fatalf("missing article: code=%d fetches=%v body=%s", w.Code, missing.calls, w.Body.String())
+	}
+
+	srv.SetCairn(fakeCairnStore{data: nzbData}, fetch)
+	if w := do(srv, http.MethodGet, cairnURL(hash, 0, "&enc=1"), nil); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("encrypted without key: code=%d body=%s", w.Code, w.Body.String())
+	}
 }
 
 func TestServeEncryptedCairnSeek(t *testing.T) {

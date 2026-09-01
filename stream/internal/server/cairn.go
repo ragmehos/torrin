@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"time"
@@ -69,30 +70,89 @@ func (s *Server) serveCairn(w http.ResponseWriter, r *http.Request, key string) 
 		s.notFound(w, r, key, err)
 		return
 	}
+	encrypted := r.URL.Query().Get("enc") == "1"
+	if encrypted && s.cipher == nil {
+		httpError(w, http.StatusServiceUnavailable, "encrypted cairn streaming unavailable")
+		return
+	}
+	if r.Method == http.MethodGet {
+		if offset, probe := s.cairnProbeOffset(r, reader, encrypted); probe {
+			var first [1]byte
+			if _, err := reader.ReadAt(first[:], offset); err != nil {
+				slog.Warn("stream: cairn article preflight failed", "key", key,
+					"range", r.Header.Get("Range"), "offset", offset, "err", err)
+				httpError(w, http.StatusBadGateway, "cairn article unavailable")
+				return
+			}
+		}
+	}
 
 	h := w.Header()
 	h.Set("Content-Type", video.ContentType(name))
 	h.Set("Cache-Control", "no-store")
-	if s.cipher != nil && r.URL.Query().Get("enc") == "1" {
-		s.serveEncrypted(w, r, key, readerEncryptedSource{reader: reader})
+	logged := loggedCairnReaderAt{reader: reader, key: key}
+	if encrypted {
+		s.serveEncrypted(w, r, key, readerEncryptedSource{reader: logged, size: reader.Size()})
 		return
 	}
 	s.setDownloadDisposition(w, r, key)
 	s.recordView(r, key)
-	http.ServeContent(w, r, name, time.Time{}, io.NewSectionReader(reader, 0, reader.Size()))
+	http.ServeContent(w, r, name, time.Time{}, io.NewSectionReader(logged, 0, reader.Size()))
 }
 
-type readerEncryptedSource struct{ reader *sharedusenet.Reader }
+func (s *Server) cairnProbeOffset(r *http.Request, reader *sharedusenet.Reader, encrypted bool) (int64, bool) {
+	total := reader.Size()
+	if encrypted {
+		plainTotal, err := s.cipher.PlainSize(total)
+		if err != nil {
+			return 0, false
+		}
+		total = plainTotal
+	}
+	if r.Header.Get("Range") == "" {
+		return 0, true
+	}
+	start, end, ok := storage.ParseRange(r.Header.Get("Range"), total)
+	if !ok {
+		return 0, false
+	}
+	if !encrypted {
+		return start, true
+	}
+	plan, err := s.cipher.PlanRange(start, end+1, total)
+	if err != nil {
+		return 0, false
+	}
+	return plan.EncStart, true
+}
+
+type loggedCairnReaderAt struct {
+	reader *sharedusenet.Reader
+	key    string
+}
+
+func (r loggedCairnReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.reader.ReadAt(p, off)
+	if err != nil && err != io.EOF {
+		slog.Warn("stream: cairn read failed", "key", r.key, "offset", off, "err", err)
+	}
+	return n, err
+}
+
+type readerEncryptedSource struct {
+	reader io.ReaderAt
+	size   int64
+}
 
 func (s readerEncryptedSource) Head(context.Context) (*storage.Object, error) {
-	return &storage.Object{Size: s.reader.Size()}, nil
+	return &storage.Object{Size: s.size}, nil
 }
 
 func (s readerEncryptedSource) Get(_ context.Context, rng string) (*storage.Object, error) {
-	start, end := int64(0), s.reader.Size()-1
+	start, end := int64(0), s.size-1
 	if rng != "" {
 		var ok bool
-		start, end, ok = storage.ParseRange(rng, s.reader.Size())
+		start, end, ok = storage.ParseRange(rng, s.size)
 		if !ok {
 			return nil, fmt.Errorf("invalid encrypted range %q", rng)
 		}
@@ -101,6 +161,6 @@ func (s readerEncryptedSource) Get(_ context.Context, rng string) (*storage.Obje
 	return &storage.Object{
 		Body:         io.NopCloser(io.NewSectionReader(s.reader, start, length)),
 		Size:         length,
-		ContentRange: fmt.Sprintf("bytes %d-%d/%d", start, end, s.reader.Size()),
+		ContentRange: fmt.Sprintf("bytes %d-%d/%d", start, end, s.size),
 	}, nil
 }

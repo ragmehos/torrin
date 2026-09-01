@@ -3,6 +3,8 @@ package stremthru
 import (
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +14,31 @@ import (
 	"github.com/torrin-app/torrin/shared/plans"
 	"github.com/torrin-app/torrin/shared/stremioid"
 )
+
+func TestTorzRoutesRegistered(t *testing.T) {
+	mux := http.NewServeMux()
+	(&Handler{}).Register(mux)
+	cases := []struct{ method, path string }{
+		{"POST", "/v0/store/torz"},
+		{"GET", "/v0/store/torz"},
+		{"GET", "/v0/store/torz/check"},
+		{"GET", "/v0/store/torz/abc"},
+		{"DELETE", "/v0/store/torz/abc"},
+		{"POST", "/v0/store/torz/link/generate"},
+	}
+	for _, c := range cases {
+		if _, pat := mux.Handler(httptest.NewRequest(c.method, c.path, nil)); pat == "" {
+			t.Errorf("%s %s not registered", c.method, c.path)
+		}
+	}
+}
+
+func TestMagnetDataIncludesPrivate(t *testing.T) {
+	h := &Handler{Deps: Deps{Store: fakeStore{err: context.DeadlineExceeded}}}
+	if d := h.magnetData(context.Background(), packJob()); d["private"] != false {
+		t.Errorf("private = %v, want false", d["private"])
+	}
+}
 
 func TestReleaseLinkPaidGate(t *testing.T) {
 	if plans.CanBYOK("free") {
@@ -36,7 +63,9 @@ func (f fakeStore) GetBytes(context.Context, string) ([]byte, error) {
 }
 func (f fakeStore) Put(context.Context, string, io.Reader, string) error { return nil }
 func (f fakeStore) SignURL(path string, _ time.Duration) string          { return "sign://" + path }
-func (f fakeStore) SignURLNode(_, path string, _ time.Duration) string   { return "sign://" + path }
+func (f fakeStore) SignURLNode(node, path string, _ time.Duration) string {
+	return "sign://" + node + "/" + path
+}
 func (f fakeStore) SignURLNodeUser(_, path, userID string, _ time.Duration) string {
 	return "sign://" + path + "?u=" + userID
 }

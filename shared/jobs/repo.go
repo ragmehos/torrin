@@ -25,3 +25,10 @@ type Repository interface {
 	RecordView(ctx context.Context, infoHash, userID string) (bool, error)
 	SetProgress(ctx context.Context, id string, pct float64, speed int64) error
 }
+
+// CachedLookup locates playable copies independently of the requesting user's
+// latest job. It is intentionally narrow so cache-tier selection can be tested
+// without a PostgreSQL repository.
+type CachedLookup interface {
+	CachedByHashes(ctx context.Context, hashes []string) (map[string]*Job, error)
+}

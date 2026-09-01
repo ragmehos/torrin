@@ -17,10 +17,12 @@ const checkBudget = 20 * time.Second
 
 func (h *Handler) checkMagnets(w http.ResponseWriter, r *http.Request, user *auth.User) {
 	var magnets []string
-	for _, p := range r.URL.Query()["magnet"] {
-		for _, m := range strings.Split(p, ",") {
-			if m = strings.TrimSpace(m); m != "" {
-				magnets = append(magnets, m)
+	for _, key := range []string{"magnet", "hash"} {
+		for _, p := range r.URL.Query()[key] {
+			for _, m := range strings.Split(p, ",") {
+				if m = strings.TrimSpace(m); m != "" {
+					magnets = append(magnets, m)
+				}
 			}
 		}
 	}
@@ -103,11 +105,11 @@ func (h *Handler) checkMagnets(w http.ResponseWriter, r *http.Request, user *aut
 	// Tier 1.5: complete on another node (per-box cache) — the local store can't see it,
 	// so one batched lookup in the shared jobs DB; links route to the job's node.
 	if still := uncached(); len(still) > 0 {
-		if h.Jobs != nil {
-			byHash, _ := h.Jobs.CachedByHashes(ctx, still)
+		if lookup := h.cachedLookup(); lookup != nil {
+			byHash, _ := lookup.CachedByHashes(ctx, still)
 			mu.Lock()
 			for hash, job := range byHash {
-				if len(job.Files) == 0 {
+				if !isWarmNodeJob(hash, job) {
 					continue
 				}
 				name := job.Name

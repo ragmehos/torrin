@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/Tensai75/nntpPool"
+	sharedusenet "github.com/torrin-app/torrin/shared/usenet"
+	"github.com/torrin-app/torrin/shared/usenet/nzb"
 )
 
 type mockNNTPServer struct {
@@ -108,6 +110,35 @@ func (p *blockingGetPool) Get(ctx context.Context) (*nntpPool.NNTPConn, error) {
 func (*blockingGetPool) Put(*nntpPool.NNTPConn) {}
 func (p *blockingGetPool) Close()               { p.closed = true }
 
+func TestFetchSegmentFailover(t *testing.T) {
+	orig := fetchOne
+	defer func() { fetchOne = orig }()
+
+	var calls int
+	fetchOne = func(_ context.Context, _ nntpPool.ConnectionPool, _, _ string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("430 no such article")
+		}
+		return []byte("payload"), nil
+	}
+	data, err := fetchSegment(context.Background(), make([]nntpPool.ConnectionPool, 2), "mid", "grp")
+	if err != nil || string(data) != "payload" || calls != 2 {
+		t.Fatalf("failover: data=%q err=%v calls=%d (want payload, nil, 2)", data, err, calls)
+	}
+}
+
+func TestFetchSegmentAllMissing(t *testing.T) {
+	orig := fetchOne
+	defer func() { fetchOne = orig }()
+	fetchOne = func(_ context.Context, _ nntpPool.ConnectionPool, _, _ string) ([]byte, error) {
+		return nil, errors.New("430 no such article")
+	}
+	if _, err := fetchSegment(context.Background(), make([]nntpPool.ConnectionPool, 3), "mid", "grp"); err == nil {
+		t.Fatal("all providers missing should return an error")
+	}
+}
+
 func TestAcquireSharedRefCount(t *testing.T) {
 	sharedMu.Lock()
 	sharedPools = map[string]*sharedEntry{}
@@ -190,7 +221,7 @@ func TestPoolArticleFetcherAgainstMockNNTP(t *testing.T) {
 		server.close(t)
 		t.Fatal(err)
 	}
-	body, err := NewArticleFetcher(pool).Fetch(context.Background(), "part-1", "alt.test")
+	body, err := NewArticleFetcher([]nntpPool.ConnectionPool{pool}).Fetch(context.Background(), "part-1", "alt.test")
 	if err != nil {
 		pool.Close()
 		server.close(t)
@@ -212,12 +243,45 @@ func TestPoolArticleFetcherAgainstMockNNTP(t *testing.T) {
 	server.close(t)
 }
 
+func TestSeekableReaderAgainstMockNNTP(t *testing.T) {
+	server := newMockNNTPServer(t)
+	host, port := server.addr()
+	pool, err := NewPool(Credentials{
+		Host: host, Port: port, Username: "alice", Password: "secret", MaxConns: 1,
+	})
+	if err != nil {
+		server.close(t)
+		t.Fatal(err)
+	}
+	reader, err := sharedusenet.NewReader(context.Background(), nzb.File{
+		Groups:   []string{"alt.test"},
+		Segments: []nzb.Segment{{MessageID: "part-1", Number: 1, Bytes: 4}},
+	}, NewArticleFetcher([]nntpPool.ConnectionPool{pool}))
+	if err != nil {
+		pool.Close()
+		server.close(t)
+		t.Fatal(err)
+	}
+	buf := make([]byte, 3)
+	if n, err := reader.ReadAt(buf, 1); err != nil || n != len(buf) || string(buf) != "BCD" {
+		t.Fatalf("seekable read: n=%d data=%q err=%v", n, buf, err)
+	}
+	commands := server.commandLog()
+	for _, want := range []string{"GROUP alt.test", "BODY <part-1>"} {
+		if !strings.Contains(commands, want) {
+			t.Fatalf("missing command %q in:\n%s", want, commands)
+		}
+	}
+	pool.Close()
+	server.close(t)
+}
+
 func TestCanceledFetchDoesNotCloseSharedPool(t *testing.T) {
 	pool := &blockingGetPool{entered: make(chan struct{}), release: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := fetchSegment(ctx, pool, "part-1", "alt.test")
+		_, err := fetchSegment(ctx, []nntpPool.ConnectionPool{pool}, "part-1", "alt.test")
 		errCh <- err
 	}()
 	<-pool.entered

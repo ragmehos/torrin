@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"math"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -22,7 +20,6 @@ import (
 	"github.com/torrin-app/torrin/shared/mediainfo"
 	"github.com/torrin-app/torrin/shared/qbit"
 	"github.com/torrin-app/torrin/shared/torrentclaw"
-	"github.com/torrin-app/torrin/shared/usenet/nzb"
 )
 
 type store interface {
@@ -46,6 +43,7 @@ type cairnStore interface {
 type Deps struct {
 	Users       *auth.Store
 	Jobs        *jobs.Postgres
+	CachedJobs  jobs.CachedLookup
 	Store       store
 	Cairns      cairnRepository
 	CairnStore  cairnStore
@@ -64,6 +62,9 @@ type Handler struct {
 }
 
 func New(d Deps) *Handler {
+	if d.CachedJobs == nil && d.Jobs != nil {
+		d.CachedJobs = d.Jobs
+	}
 	if d.Cairns == nil {
 		d.Cairns = d.Users
 	}
@@ -87,6 +88,12 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/store/newz/{id}", h.withAuth(h.getNewz))
 	mux.HandleFunc("DELETE /v0/store/newz/{id}", h.withAuth(h.removeNewz))
 	mux.HandleFunc("POST /v0/store/newz/link/generate", h.withAuth(h.generateLink))
+	mux.HandleFunc("GET /v0/store/torz/check", h.withAuth(h.checkMagnets))
+	mux.HandleFunc("GET /v0/store/torz", h.withAuth(h.listMagnets))
+	mux.HandleFunc("POST /v0/store/torz", h.withAuth(h.addMagnet))
+	mux.HandleFunc("GET /v0/store/torz/{id}", h.withAuth(h.getMagnet))
+	mux.HandleFunc("DELETE /v0/store/torz/{id}", h.withAuth(h.deleteMagnet))
+	mux.HandleFunc("POST /v0/store/torz/link/generate", h.withAuth(h.generateLink))
 }
 
 func (h *Handler) withAuth(next func(http.ResponseWriter, *http.Request, *auth.User)) http.HandlerFunc {
@@ -139,16 +146,16 @@ func (h *Handler) assign(job *jobs.Job) {
 func (h *Handler) magnetData(ctx context.Context, j *jobs.Job) map[string]any {
 	m := map[string]any{
 		"id": j.ID, "hash": j.InfoHash, "magnet": magnet.Build(j.InfoHash, j.Name), "name": j.Name, "status": stStatus(j.Status),
-		"size": j.FileSize, "added_at": j.CreatedAt.Format(time.RFC3339),
+		"size": j.FileSize, "added_at": j.CreatedAt.Format(time.RFC3339), "private": false,
 		"files": []map[string]any{},
 	}
-	if name, size, files, ok := h.cachedJobFiles(ctx, j.InfoHash); ok {
+	if cached, ok := h.cachedJobFiles(ctx, j.InfoHash); ok {
 		m["status"] = "downloaded"
-		m["size"] = size
-		files = jobs.FilesForEpisode(j, files, j.Season, j.Episode)
-		m["files"] = h.buildFileEntries(j.UserID, j.InfoHash, h.Jobs.NodeForInfoHash(ctx, j.InfoHash), files)
-		if name != "" {
-			m["name"] = name
+		m["size"] = cached.size
+		files := jobs.FilesForEpisode(j, cached.files, j.Season, j.Episode)
+		m["files"] = h.buildFileEntries(j.UserID, j.InfoHash, cached.node, files)
+		if cached.name != "" {
+			m["name"] = cached.name
 		}
 	} else if j.Status == jobs.StatusComplete || j.Status == jobs.StatusSeeding {
 		files := j.Files
@@ -195,101 +202,6 @@ func (h *Handler) manifestMeta(ctx context.Context, infoHash string) (name strin
 		return "", 0, nil
 	}
 	return manifest.Meta(data)
-}
-
-func (h *Handler) warmJobFiles(ctx context.Context, infoHash string) (string, int64, []jobs.File, bool) {
-	if manifest.Playable(ctx, h.Store, infoHash) {
-		name, size, files := h.manifestMeta(ctx, infoHash)
-		if len(files) > 0 {
-			return name, size, files, true
-		}
-	}
-	return "", 0, nil, false
-}
-
-func (h *Handler) cairnJobFiles(ctx context.Context, infoHash string) (string, int64, []jobs.File, bool) {
-	if !h.CairnDirect || h.Cairns == nil || h.CairnStore == nil {
-		return "", 0, nil, false
-	}
-	_, name, archived := h.Cairns.GetCairnArchive(ctx, infoHash)
-	if !archived {
-		return "", 0, nil, false
-	}
-	data, err := h.CairnStore.GetBytes(ctx, nzb.StorageKey(infoHash))
-	if err != nil {
-		if fallback, ok := h.Cairns.GetCairnNZB(ctx, infoHash); ok {
-			data, err = fallback, nil
-		}
-	}
-	if err != nil {
-		return "", 0, nil, false
-	}
-	parsed, err := nzb.ParseBytes(data)
-	if err != nil || len(parsed.Files) == 0 {
-		return "", 0, nil, false
-	}
-	enc := h.CairnCipher != nil
-	files := make([]jobs.File, len(parsed.Files))
-	var total int64
-	for i, file := range parsed.Files {
-		fileName := file.Filename
-		if fileName == "" {
-			fileName = file.Subject
-		}
-		fileName = filepath.Base(fileName)
-		if fileName == "." || fileName == "" {
-			return "", 0, nil, false
-		}
-		size := file.Size()
-		if enc {
-			size, err = h.CairnCipher.PlainSize(size)
-			if err != nil {
-				return "", 0, nil, false
-			}
-		}
-		if size < 0 {
-			return "", 0, nil, false
-		}
-		if total > math.MaxInt64-size {
-			return "", 0, nil, false
-		}
-		total += size
-		files[i] = jobs.File{Index: i, Name: fileName, Size: size, Key: cairn.StreamPath(infoHash, i, fileName), Enc: enc}
-	}
-	if name == "" {
-		name = parsed.Name()
-	}
-	return name, total, files, true
-}
-
-func (h *Handler) cachedJobFiles(ctx context.Context, infoHash string) (string, int64, []jobs.File, bool) {
-	if name, size, files, ok := h.warmJobFiles(ctx, infoHash); ok {
-		return name, size, files, true
-	}
-	return h.cairnJobFiles(ctx, infoHash)
-}
-
-func (h *Handler) cachedFileEntries(ctx context.Context, userID, infoHash string, filesFn func(context.Context, string) (string, int64, []jobs.File, bool)) (string, []map[string]any, bool) {
-	name, _, files, ok := filesFn(ctx, infoHash)
-	if !ok {
-		return "", nil, false
-	}
-	return name, h.buildFileEntries(userID, infoHash, h.Jobs.NodeForInfoHash(ctx, infoHash), files), true
-}
-
-func (h *Handler) warmCachedFiles(ctx context.Context, userID, infoHash string) (string, []map[string]any, bool) {
-	return h.cachedFileEntries(ctx, userID, infoHash, h.warmJobFiles)
-}
-
-func (h *Handler) cairnCachedFiles(ctx context.Context, userID, infoHash string) (string, []map[string]any, bool) {
-	return h.cachedFileEntries(ctx, userID, infoHash, h.cairnJobFiles)
-}
-
-func (h *Handler) cachedFiles(ctx context.Context, userID, infoHash string) (string, []map[string]any, bool) {
-	if name, files, ok := h.warmCachedFiles(ctx, userID, infoHash); ok {
-		return name, files, true
-	}
-	return h.cairnCachedFiles(ctx, userID, infoHash)
 }
 
 func stStatus(s jobs.Status) string {

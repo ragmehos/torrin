@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/torrin-app/torrin/shared/auth"
+	"github.com/torrin-app/torrin/shared/cairn"
 	"github.com/torrin-app/torrin/shared/crypto"
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/manifest"
@@ -18,6 +19,18 @@ type fakeCairnRepository struct {
 	hash string
 	name string
 	nzb  []byte
+}
+
+type fakeCachedLookup map[string]*jobs.Job
+
+func (f fakeCachedLookup) CachedByHashes(_ context.Context, hashes []string) (map[string]*jobs.Job, error) {
+	out := make(map[string]*jobs.Job, len(hashes))
+	for _, hash := range hashes {
+		if job := f[hash]; job != nil {
+			out[hash] = job
+		}
+	}
+	return out, nil
 }
 
 func (f fakeCairnRepository) GetCairnArchive(_ context.Context, hash string) (string, string, bool) {
@@ -147,5 +160,39 @@ func TestWarmCacheWinsOverDirectCairn(t *testing.T) {
 	link, _ := files[0]["link"].(string)
 	if strings.Contains(link, "/cairn/") || !strings.Contains(link, "warm/object") {
 		t.Errorf("warm cache did not win: %q", link)
+	}
+}
+
+func TestCrossNodeWarmCacheWinsOverDirectCairn(t *testing.T) {
+	hash := strings.Repeat("d", 40)
+	h := directCairnHandler(t, hash)
+	h.CachedJobs = fakeCachedLookup{hash: {
+		InfoHash: hash, Name: "Remote Warm Movie", Status: jobs.StatusComplete, Node: "box2", FileSize: 4321,
+		Files: []jobs.File{{Index: 0, Name: "remote-warm.mkv", Size: 4321, Key: "blobs/remote-warm"}},
+	}}
+
+	data := h.magnetData(context.Background(), &jobs.Job{
+		ID: "job-remote", UserID: "user-4", InfoHash: hash, Name: "Evicted", Status: jobs.StatusEvicted,
+	})
+	files, _ := data["files"].([]map[string]any)
+	if data["status"] != "downloaded" || data["name"] != "Remote Warm Movie" || len(files) != 1 {
+		t.Fatalf("resolved item = %+v", data)
+	}
+	link, _ := files[0]["link"].(string)
+	if strings.Contains(link, "/cairn/") || !strings.Contains(link, "sign://box2/blobs/remote-warm") {
+		t.Errorf("cross-node warm cache did not win: %q", link)
+	}
+}
+
+func TestCairnBackedJobIsNotMistakenForWarmNode(t *testing.T) {
+	hash := strings.Repeat("e", 40)
+	h := directCairnHandler(t, hash)
+	h.CachedJobs = fakeCachedLookup{hash: {
+		InfoHash: hash, Name: "Cairn Record", Status: jobs.StatusComplete,
+		Files: []jobs.File{{Index: 0, Name: "movie.mkv", Size: 100, Key: cairn.StreamPath(hash, 0, "movie.mkv")}},
+	}}
+
+	if cached, ok := h.nodeJobFiles(context.Background(), hash); ok {
+		t.Fatalf("Cairn-backed job resolved as warm node: %+v", cached)
 	}
 }

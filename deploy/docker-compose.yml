@@ -95,8 +95,15 @@ services:
       CAIRN_S3_REGION: "${CAIRN_S3_REGION:-auto}"
       BUDGET_MAX_BYTES: "${BUDGET_MAX_BYTES:-1000000000000}"
       EVICTION_CAP_BYTES: "${EVICTION_CAP_BYTES:-300000000000}"
+      STORE_MIN_FREE_BYTES: "${STORE_MIN_FREE_BYTES:-0}"
+      PRIMARY_NODE_ID: "${PRIMARY_NODE_ID:-}"
       NODE2_ID: "${NODE2_ID:-}"
       CLUSTER_NODES: "${CLUSTER_NODES:-}"
+      STORE_NODES: "${STORE_NODES:-}"
+      STORE_S3_REGION: "${STORE_S3_REGION:-auto}"
+      STORE_S3_ACCESS_KEY: "${STORE_S3_ACCESS_KEY:-}"
+      STORE_S3_SECRET_KEY: "${STORE_S3_SECRET_KEY:-}"
+      STORE_S3_BUCKET: "${STORE_S3_BUCKET:-torrin}"
       EVICTION_HOUR: "${EVICTION_HOUR:-4}"
       PREWARM_MAX_ACTIVE: "${PREWARM_MAX_ACTIVE:-3}"
       PREWARM_MAX_BYTES_GB: "${PREWARM_MAX_BYTES_GB:-25}"
@@ -167,6 +174,16 @@ services:
       DATABASE_URL: *db
       NATS_URL: *nats
       NODE_ID: "${NODE_ID:-}"
+      PRIMARY_NODE_ID: "${PRIMARY_NODE_ID:-}"
+      NODE2_ID: "${NODE2_ID:-}"
+      CLUSTER_NODES: "${CLUSTER_NODES:-}"
+      EVICTION_CAP_BYTES: "${EVICTION_CAP_BYTES:-300000000000}"
+      STORE_MIN_FREE_BYTES: "${STORE_MIN_FREE_BYTES:-0}"
+      STORE_NODES: "${STORE_NODES:-}"
+      STORE_S3_REGION: "${STORE_S3_REGION:-auto}"
+      STORE_S3_ACCESS_KEY: "${STORE_S3_ACCESS_KEY:-}"
+      STORE_S3_SECRET_KEY: "${STORE_S3_SECRET_KEY:-}"
+      STORE_S3_BUCKET: "${STORE_S3_BUCKET:-torrin}"
       CACHE_RC_URLS: "${CACHE_RC_URLS:-}"
       SCRATCH_DIR: "/scratch"
       CAIRN_S3_ENDPOINT: "${CAIRN_S3_ENDPOINT:-}"
@@ -197,15 +214,39 @@ services:
       qbittorrent: { condition: service_started }
     restart: *restart
 
+  evictor:
+    image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/evictor:${TORRIN_TAG:-latest}"
+    user: "0:0"
+    volumes:
+      - /mnt/cache/store:/mnt/cache/store
+    environment:
+      <<: *s3
+      PORT: "8089"
+      DATABASE_URL: *db
+      PUBLIC_URL: *public-url
+      NODE_ID: "${NODE_ID:-}"
+      STORE_DIR: "/mnt/cache/store"
+      EVICTION_CAP_BYTES: "${EVICTION_CAP_BYTES:-300000000000}"
+      EVICTION_HOUR: "${EVICTION_HOUR:-4}"
+      STORE_MIN_FREE_BYTES: "${STORE_MIN_FREE_BYTES:-0}"
+      STORE_RECLAIM_BYTES: "${STORE_RECLAIM_BYTES:-0}"
+      HEARTBEAT_SECONDS: "${HEARTBEAT_SECONDS:-45}"
+    depends_on: *needs-pg
+    restart: *restart
+
   cairn:
     image: "${GHCR_REPO:-ghcr.io/torrin-app/torrin}/cairn:${TORRIN_TAG:-latest}"
     user: "0:0"
     dns_opt: ["single-request-reopen"]
+    volumes:
+      - /mnt/cache/store:/mnt/cache/store
     environment:
       <<: *s3
       PORT: "8087"
       DATABASE_URL: *db
       NATS_URL: *nats
+      NODE_ID: "${NODE_ID:-}"
+      STORE_DIR: "/mnt/cache/store"
       USENET_POST_HOST: "${USENET_POST_HOST:-}"
       USENET_POST_PORT: "${USENET_POST_PORT:-563}"
       USENET_POST_USER: "${USENET_POST_USER:-}"

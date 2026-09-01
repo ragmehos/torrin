@@ -1,14 +1,76 @@
 package addon
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/torrin-app/torrin/shared/cairn"
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/stremioid"
 )
+
+type fakeJobRepository struct {
+	warm   map[string]*jobs.Job
+	byHash map[string][]*jobs.Job
+	byIMDB []*jobs.Job
+	byBYOS []*jobs.Job
+}
+
+func (f *fakeJobRepository) CachedByHashes(_ context.Context, hashes []string) (map[string]*jobs.Job, error) {
+	out := map[string]*jobs.Job{}
+	for _, hash := range hashes {
+		if job := f.warm[hash]; job != nil {
+			out[hash] = job
+		}
+	}
+	return out, nil
+}
+
+func (*fakeJobRepository) RecordView(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+func (f *fakeJobRepository) ListByInfoHash(_ context.Context, hash string) ([]*jobs.Job, error) {
+	return f.byHash[hash], nil
+}
+func (f *fakeJobRepository) ListByIMDB(context.Context, string) ([]*jobs.Job, error) {
+	return f.byIMDB, nil
+}
+func (f *fakeJobRepository) ListUserByosByIMDB(context.Context, string, string) ([]*jobs.Job, error) {
+	return f.byBYOS, nil
+}
+func (*fakeJobRepository) ListByTitleNorm(context.Context, string) ([]*jobs.Job, error) {
+	return nil, nil
+}
+
+type fakeStreamStore struct {
+	manifest []byte
+	err      error
+}
+
+func (f fakeStreamStore) GetBytes(context.Context, string) ([]byte, error) {
+	return f.manifest, f.err
+}
+func (fakeStreamStore) SignURLNode(node, path string, _ time.Duration) string {
+	return "node://" + node + "/" + path + "?signed=1"
+}
+func (fakeStreamStore) SignURLNodeUser(node, path, userID string, _ time.Duration) string {
+	return "user://" + node + "/" + path + "?u=" + userID + "&signed=1"
+}
+
+func streamLink(t *testing.T, streams []map[string]any) string {
+	t.Helper()
+	if len(streams) != 1 {
+		t.Fatalf("streams = %+v, want one", streams)
+	}
+	link, _ := streams[0]["url"].(string)
+	return link
+}
 
 func TestLibraryFilesFiltersRequestedEpisode(t *testing.T) {
 	j := &jobs.Job{Season: 5, Files: []jobs.File{
@@ -96,6 +158,87 @@ func TestEntryIncludesPlaybackHints(t *testing.T) {
 	}
 	if _, ok := mp4Hints["videoSize"]; ok {
 		t.Error("unknown video size should be omitted")
+	}
+}
+
+func TestByLibraryPrefersCrossNodeWarmOverCairn(t *testing.T) {
+	hash := strings.Repeat("a", 40)
+	direct := &jobs.Job{InfoHash: hash, Season: 5, Episode: 2, Files: []jobs.File{{
+		Index: 1, Name: "Show.S05E02.mkv", Size: 200, Key: cairn.StreamPath(hash, 1, "Show.S05E02.mkv"),
+	}}}
+	warm := &jobs.Job{InfoHash: hash, Node: "box2", Files: []jobs.File{{
+		Index: 1, Name: "Show.S05E02.mkv", Size: 200, Key: "blobs/warm-episode",
+	}}}
+	s := &Server{
+		jobs:  &fakeJobRepository{warm: map[string]*jobs.Job{hash: warm}, byIMDB: []*jobs.Job{direct}, byBYOS: []*jobs.Job{direct}},
+		store: fakeStreamStore{},
+	}
+	r := httptest.NewRequest(http.MethodGet, "/stream/series/tt1234567:5:2", nil)
+	link := streamLink(t, s.byLibrary(r, "series", stremioid.Parse("tt1234567:5:2"), "user-1", true))
+	if !strings.Contains(link, "node://box2/blobs/warm-episode") || strings.Contains(link, "/cairn/") || strings.Contains(link, "byos=1") {
+		t.Fatalf("warm link = %q", link)
+	}
+}
+
+func TestByLibraryCairnURLIsUserBound(t *testing.T) {
+	hash := strings.Repeat("b", 40)
+	direct := &jobs.Job{InfoHash: hash, Files: []jobs.File{{
+		Index: 2, Name: "Show.S05E02.mkv", Size: 200, Key: cairn.StreamPath(hash, 2, "Show.S05E02.mkv"),
+	}}}
+	s := &Server{jobs: &fakeJobRepository{byIMDB: []*jobs.Job{direct}}, store: fakeStreamStore{}}
+	r := httptest.NewRequest(http.MethodGet, "/stream/series/tt1234567:5:2", nil)
+	link := streamLink(t, s.byLibrary(r, "series", stremioid.Parse("tt1234567:5:2"), "user-2", false))
+	if !strings.Contains(link, hash+"/cairn/2/Show.S05E02.mkv") || !strings.Contains(link, "?u=user-2") {
+		t.Fatalf("direct Cairn link = %q", link)
+	}
+}
+
+func TestByLibraryPrefersUserBYOSOverCairnWithoutWarmCopy(t *testing.T) {
+	hash := strings.Repeat("e", 40)
+	direct := &jobs.Job{InfoHash: hash, Files: []jobs.File{{
+		Name: "Show.S05E02.mkv", Key: cairn.StreamPath(hash, 0, "Show.S05E02.mkv"),
+	}}}
+	byos := &jobs.Job{InfoHash: hash, Node: "box2", Files: []jobs.File{{
+		Name: "Show.S05E02.mkv", Key: "blobs/byos-episode",
+	}}}
+	s := &Server{
+		jobs:  &fakeJobRepository{byIMDB: []*jobs.Job{direct}, byBYOS: []*jobs.Job{byos}},
+		store: fakeStreamStore{},
+	}
+	r := httptest.NewRequest(http.MethodGet, "/stream/series/tt1234567:5:2", nil)
+	link := streamLink(t, s.byLibrary(r, "series", stremioid.Parse("tt1234567:5:2"), "user-5", true))
+	if !strings.Contains(link, "user://box2/blobs/byos-episode?u=user-5") || !strings.Contains(link, "byos=1") {
+		t.Fatalf("BYOS link = %q", link)
+	}
+}
+
+func TestByHashFallsBackToCrossNodeWarm(t *testing.T) {
+	hash := strings.Repeat("c", 40)
+	warm := &jobs.Job{InfoHash: hash, Node: "box3", Files: []jobs.File{{Name: "movie.mkv", Key: "blobs/movie", Size: 300}}}
+	s := &Server{
+		jobs:  &fakeJobRepository{warm: map[string]*jobs.Job{hash: warm}},
+		store: fakeStreamStore{err: errors.New("local manifest missing")},
+	}
+	r := httptest.NewRequest(http.MethodGet, "/stream/movie/"+hash, nil)
+	link := streamLink(t, s.byHash(r, hash, "user-3", false))
+	if !strings.Contains(link, "node://box3/blobs/movie") {
+		t.Fatalf("cross-node hash link = %q", link)
+	}
+}
+
+func TestByHashFallsBackToUserBoundCairn(t *testing.T) {
+	hash := strings.Repeat("d", 40)
+	direct := &jobs.Job{InfoHash: hash, Status: jobs.StatusComplete, Files: []jobs.File{{
+		Name: "movie.mkv", Key: cairn.StreamPath(hash, 0, "movie.mkv"), Size: 300,
+	}}}
+	s := &Server{
+		jobs:  &fakeJobRepository{byHash: map[string][]*jobs.Job{hash: {direct}}},
+		store: fakeStreamStore{err: errors.New("local manifest missing")},
+	}
+	r := httptest.NewRequest(http.MethodGet, "/stream/movie/"+hash, nil)
+	link := streamLink(t, s.byHash(r, hash, "user-4", false))
+	if !strings.Contains(link, hash+"/cairn/0/movie.mkv") || !strings.Contains(link, "?u=user-4") {
+		t.Fatalf("direct hash Cairn link = %q", link)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/torrin-app/torrin/api/internal/middleware"
 	"github.com/torrin-app/torrin/shared/auth"
+	"github.com/torrin-app/torrin/shared/cairn"
 	"github.com/torrin-app/torrin/shared/crypto"
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/manifest"
@@ -22,6 +23,18 @@ type fakeCairns struct {
 	items  []auth.CairnItem
 	nzbs   map[string][]byte
 	listed string
+}
+
+type fakeCachedLookup map[string]*jobs.Job
+
+func (f fakeCachedLookup) CachedByHashes(_ context.Context, hashes []string) (map[string]*jobs.Job, error) {
+	out := make(map[string]*jobs.Job, len(hashes))
+	for _, hash := range hashes {
+		if job := f[hash]; job != nil {
+			out[hash] = job
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeCairns) GetCairnArchive(_ context.Context, hash string) (string, string, bool) {
@@ -75,6 +88,7 @@ func TestCairnListReportsWarmAndDirectStreamsAsCached(t *testing.T) {
 	warmHash := strings.Repeat("a", 40)
 	coldHash := strings.Repeat("b", 40)
 	pendingHash := strings.Repeat("c", 40)
+	remoteHash := strings.Repeat("d", 40)
 	warmManifest, _ := (manifest.Manifest{InfoHash: warmHash, Name: "Warm", Files: []manifest.File{
 		{FileName: "warm.mkv", DirectURL: "blobs/b_warm", FileSize: 1234},
 	}}).Marshal()
@@ -93,15 +107,27 @@ func TestCairnListReportsWarmAndDirectStreamsAsCached(t *testing.T) {
 		bytesByKey: map[string][]byte{manifest.Path(warmHash): warmManifest},
 		hasByKey:   map[string]bool{"blobs/b_warm": true},
 	}
-	archive := &fakeStore{bytesByKey: map[string][]byte{nzb.StorageKey(coldHash): coldNZB}}
+	archive := &fakeStore{bytesByKey: map[string][]byte{
+		nzb.StorageKey(coldHash): coldNZB, nzb.StorageKey(remoteHash): coldNZB,
+	}}
 	repo := &fakeCairns{items: []auth.CairnItem{
 		{InfoHash: warmHash, Name: "Warm", Archived: true},
 		{InfoHash: coldHash, Name: "Cold", Archived: true},
 		{InfoHash: pendingHash, Name: "Pending", Archived: false},
+		{InfoHash: remoteHash, Name: "Remote", Archived: true},
 	}}
 	s := New(Deps{
 		Jobs: &fakeRepo{}, Store: primary, Cairns: repo, CairnStore: archive,
-		CairnCipher: cipher, CairnDirect: true,
+		CairnCipher: cipher, CairnDirect: true, CachedJobs: fakeCachedLookup{
+			coldHash: {
+				InfoHash: coldHash, Name: "Cairn Record", Status: jobs.StatusComplete,
+				Files: []jobs.File{{Index: 0, Name: "cold.mkv", Size: coldPlainSize, Key: cairn.StreamPath(coldHash, 0, "cold.mkv")}},
+			},
+			remoteHash: {
+				InfoHash: remoteHash, Name: "Remote", Status: jobs.StatusComplete, Node: "box2",
+				Files: []jobs.File{{Index: 0, Name: "remote.mkv", Size: 4321, Key: "blobs/b_remote"}},
+			},
+		},
 	})
 	r := httptest.NewRequest("GET", "/api/cairn", nil)
 	r = r.WithContext(context.WithValue(r.Context(), middleware.UserContextKey, &auth.User{ID: "u1"}))
@@ -116,7 +142,7 @@ func TestCairnListReportsWarmAndDirectStreamsAsCached(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if repo.listed != "u1" || len(response.Cairns) != 3 {
+	if repo.listed != "u1" || len(response.Cairns) != 4 {
 		t.Fatalf("listed=%q items=%d", repo.listed, len(response.Cairns))
 	}
 	warm := response.Cairns[0]
@@ -134,6 +160,12 @@ func TestCairnListReportsWarmAndDirectStreamsAsCached(t *testing.T) {
 	pending := response.Cairns[2]
 	if pending.Cached || pending.StreamSource != "" || len(pending.StreamURLs) != 0 {
 		t.Fatalf("pending item = %+v", pending)
+	}
+	remote := response.Cairns[3]
+	if !remote.Cached || remote.StreamSource != "cache" || len(remote.StreamURLs) != 1 ||
+		strings.Contains(remote.StreamURLs[0].SignedURL, "/cairn/") ||
+		!strings.Contains(remote.StreamURLs[0].SignedURL, "signed://box2/blobs/b_remote") {
+		t.Fatalf("remote warm item = %+v", remote)
 	}
 }
 

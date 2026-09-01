@@ -110,23 +110,46 @@ func (s *Server) cairnList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cachedCairnStreams(r *http.Request, userID, hash string) ([]jobs.Stream, bool) {
-	if !manifest.Playable(r.Context(), s.Store, hash) {
+	if manifest.Playable(r.Context(), s.Store, hash) {
+		data, err := s.Store.GetBytes(r.Context(), manifest.Path(hash))
+		if err == nil {
+			man, parseErr := manifest.Parse(data)
+			if parseErr == nil && len(man.Files) > 0 {
+				files := make([]jobs.File, len(man.Files))
+				for i, f := range man.Files {
+					files[i] = jobs.File{Index: i, Name: f.FileName, Size: f.FileSize, Key: f.DirectURL, Enc: f.Enc}
+				}
+				job := &jobs.Job{UserID: userID, InfoHash: hash, Node: s.Jobs.NodeForInfoHash(r.Context(), hash), Files: files}
+				return s.signStreams(job, r), true
+			}
+		}
+	}
+
+	lookup := s.CachedJobs
+	if lookup == nil && s.JobsPG != nil {
+		lookup = s.JobsPG
+	}
+	if lookup == nil {
 		return nil, false
 	}
-	data, err := s.Store.GetBytes(r.Context(), manifest.Path(hash))
+	byHash, err := lookup.CachedByHashes(r.Context(), []string{hash})
 	if err != nil {
 		return nil, false
 	}
-	man, err := manifest.Parse(data)
-	if err != nil || len(man.Files) == 0 {
+	job := byHash[hash]
+	if job == nil || job.Node == "" || len(job.Files) == 0 {
 		return nil, false
 	}
-	files := make([]jobs.File, len(man.Files))
-	for i, f := range man.Files {
-		files[i] = jobs.File{Index: i, Name: f.FileName, Size: f.FileSize, Key: f.DirectURL, Enc: f.Enc}
+	streams := make([]jobs.Stream, len(job.Files))
+	for i, file := range job.Files {
+		key := manifest.ResolveKey(hash, i, file.Key, file.Name)
+		if _, _, _, direct := cairn.ParseStreamPath(key); direct {
+			return nil, false
+		}
+		u := s.Store.SignURLNode(job.Node, key, 24*time.Hour) + manifest.StreamQuery(hash, file.Enc)
+		streams[i] = jobs.Stream{FileName: file.Name, Size: file.Size, SignedURL: georoute.URL(r, u)}
 	}
-	job := &jobs.Job{UserID: userID, InfoHash: hash, Node: s.Jobs.NodeForInfoHash(r.Context(), hash), Files: files}
-	return s.signStreams(job, r), true
+	return streams, true
 }
 
 func (s *Server) directCairnStreams(r *http.Request, userID, hash string) ([]jobs.Stream, error) {

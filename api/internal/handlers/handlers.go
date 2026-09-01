@@ -50,6 +50,7 @@ type CairnStore interface {
 type Deps struct {
 	Jobs        jobs.Repository
 	JobsPG      *jobs.Postgres
+	CachedJobs  jobs.CachedLookup
 	Users       *auth.Store
 	Cairns      CairnRepository
 	Store       Storage
@@ -96,6 +97,9 @@ type Server struct {
 }
 
 func New(d Deps) *Server {
+	if d.CachedJobs == nil && d.JobsPG != nil {
+		d.CachedJobs = d.JobsPG
+	}
 	if d.Cairns == nil {
 		d.Cairns = d.Users
 	}

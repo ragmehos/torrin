@@ -72,7 +72,7 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 		}
 	}
 
-	cacheName, cacheSize, cacheFiles, cached := h.cachedJobFiles(r.Context(), infoHash)
+	cache, cached := h.cachedJobFiles(r.Context(), infoHash)
 	plan, _ := plans.Get(user.PlanID)
 
 	existing, err := h.Jobs.GetByInfoHash(r.Context(), infoHash)
@@ -125,10 +125,10 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 	}
 	if cached {
 		job.Status = jobs.StatusComplete
-		if cacheName != "" {
-			job.Name = cacheName
+		if cache.name != "" {
+			job.Name = cache.name
 		}
-		job.FileSize, job.Files = cacheSize, cacheFiles
+		job.FileSize, job.Files, job.Node = cache.size, cache.files, cache.node
 	}
 	h.Jobs.Create(r.Context(), job)
 	if !cached {

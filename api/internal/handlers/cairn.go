@@ -139,21 +139,31 @@ func (s *Server) cairnCachedJobs(ctx context.Context, hashes []string) map[strin
 }
 
 func (s *Server) cachedCairnStreams(r *http.Request, userID, hash string, remote *jobs.Job) ([]jobs.Stream, bool) {
-	if manifest.Playable(r.Context(), s.Store, hash) {
-		data, err := s.Store.GetBytes(r.Context(), manifest.Path(hash))
-		if err == nil {
-			man, parseErr := manifest.Parse(data)
-			if parseErr == nil && len(man.Files) > 0 {
+	if remote == nil {
+		return nil, false
+	}
+	if remote.Node != "" {
+		if streams, ok := s.nodeCairnStreams(r, hash, remote); ok {
+			return streams, true
+		}
+	}
+	data, err := s.Store.GetBytes(r.Context(), manifest.Path(hash))
+	if err == nil {
+		man, parseErr := manifest.Parse(data)
+		if parseErr == nil && len(man.Files) > 0 {
+			first := man.Files[0]
+			key := manifest.ResolveKey(hash, 0, first.DirectURL, first.FileName)
+			if playable, _ := s.Store.Has(r.Context(), key); playable {
 				files := make([]jobs.File, len(man.Files))
 				for i, f := range man.Files {
 					files[i] = jobs.File{Index: i, Name: f.FileName, Size: f.FileSize, Key: f.DirectURL, Enc: f.Enc}
 				}
-				job := &jobs.Job{UserID: userID, InfoHash: hash, Node: s.Jobs.NodeForInfoHash(r.Context(), hash), Files: files}
+				job := &jobs.Job{UserID: userID, InfoHash: hash, Node: remote.Node, Files: files}
 				return s.signStreams(job, r), true
 			}
 		}
 	}
-	return s.nodeCairnStreams(r, hash, remote)
+	return nil, false
 }
 
 func (s *Server) nodeCairnStreams(r *http.Request, hash string, job *jobs.Job) ([]jobs.Stream, bool) {

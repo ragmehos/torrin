@@ -11,7 +11,6 @@ import (
 
 	"github.com/torrin-app/torrin/api/internal/middleware"
 	"github.com/torrin-app/torrin/shared/auth"
-	"github.com/torrin-app/torrin/shared/cairn"
 	"github.com/torrin-app/torrin/shared/crypto"
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/manifest"
@@ -41,6 +40,22 @@ type recordingCachedLookup struct {
 	jobs   fakeCachedLookup
 	calls  int
 	hashes []string
+}
+
+type countingStorage struct {
+	Storage
+	gets map[string]int
+	has  map[string]int
+}
+
+func (s *countingStorage) GetBytes(ctx context.Context, key string) ([]byte, error) {
+	s.gets[key]++
+	return s.Storage.GetBytes(ctx, key)
+}
+
+func (s *countingStorage) Has(ctx context.Context, key string) (bool, error) {
+	s.has[key]++
+	return s.Storage.Has(ctx, key)
 }
 
 func (f *recordingCachedLookup) CachedByHashes(ctx context.Context, hashes []string) (map[string]*jobs.Job, error) {
@@ -101,8 +116,12 @@ func TestCairnListReportsWarmAndDirectStreamsAsCached(t *testing.T) {
 	coldHash := strings.Repeat("b", 40)
 	pendingHash := strings.Repeat("c", 40)
 	remoteHash := strings.Repeat("d", 40)
+	legacyHash := strings.Repeat("e", 40)
 	warmManifest, _ := (manifest.Manifest{InfoHash: warmHash, Name: "Warm", Files: []manifest.File{
 		{FileName: "warm.mkv", DirectURL: "blobs/b_warm", FileSize: 1234},
+	}}).Marshal()
+	legacyManifest, _ := (manifest.Manifest{InfoHash: legacyHash, Name: "Legacy", Files: []manifest.File{
+		{FileName: "legacy.mkv", DirectURL: "blobs/b_legacy", FileSize: 2345},
 	}}).Marshal()
 
 	cipher, err := crypto.NewStream(strings.Repeat("ab", 32))
@@ -115,27 +134,34 @@ func TestCairnListReportsWarmAndDirectStreamsAsCached(t *testing.T) {
 		{MessageID: "cold-1", Number: 1, Bytes: coldEncryptedSize},
 	}}})
 
-	primary := &fakeStore{
-		bytesByKey: map[string][]byte{manifest.Path(warmHash): warmManifest},
-		hasByKey:   map[string]bool{"blobs/b_warm": true},
+	primaryStore := &fakeStore{
+		bytesByKey: map[string][]byte{manifest.Path(warmHash): warmManifest, manifest.Path(legacyHash): legacyManifest},
+		hasByKey:   map[string]bool{"blobs/b_warm": true, "blobs/b_legacy": true},
 	}
-	archive := &fakeStore{bytesByKey: map[string][]byte{
+	primary := &countingStorage{Storage: primaryStore, gets: map[string]int{}, has: map[string]int{}}
+	archiveStore := &fakeStore{bytesByKey: map[string][]byte{
 		nzb.StorageKey(coldHash): coldNZB, nzb.StorageKey(remoteHash): coldNZB,
 	}}
+	archive := &countingStorage{Storage: archiveStore, gets: map[string]int{}, has: map[string]int{}}
 	repo := &fakeCairns{items: []auth.CairnItem{
 		{InfoHash: warmHash, Name: "Warm", Archived: true},
 		{InfoHash: coldHash, Name: "Cold", Archived: true},
 		{InfoHash: pendingHash, Name: "Pending", Archived: false},
 		{InfoHash: remoteHash, Name: "Remote", Archived: true},
+		{InfoHash: legacyHash, Name: "Legacy", Archived: true},
 	}}
 	lookup := &recordingCachedLookup{jobs: fakeCachedLookup{
-		coldHash: {
-			InfoHash: coldHash, Name: "Cairn Record", Status: jobs.StatusComplete,
-			Files: []jobs.File{{Index: 0, Name: "cold.mkv", Size: coldPlainSize, Key: cairn.StreamPath(coldHash, 0, "cold.mkv")}},
+		warmHash: {
+			InfoHash: warmHash, Name: "Warm", Status: jobs.StatusComplete, Node: "box1",
+			Files: []jobs.File{{Index: 0, Name: "warm.mkv", Size: 1234, Key: "blobs/b_warm"}},
 		},
 		remoteHash: {
 			InfoHash: remoteHash, Name: "Remote", Status: jobs.StatusComplete, Node: "box2",
 			Files: []jobs.File{{Index: 0, Name: "remote.mkv", Size: 4321, Key: "blobs/b_remote"}},
+		},
+		legacyHash: {
+			InfoHash: legacyHash, Name: "Legacy", Status: jobs.StatusComplete,
+			Files: []jobs.File{{Index: 0, Name: "legacy.mkv", Size: 2345, Key: "blobs/b_legacy"}},
 		},
 	}}
 	s := New(Deps{
@@ -155,11 +181,33 @@ func TestCairnListReportsWarmAndDirectStreamsAsCached(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if repo.listed != "u1" || len(response.Cairns) != 4 {
+	if repo.listed != "u1" || len(response.Cairns) != 5 {
 		t.Fatalf("listed=%q items=%d", repo.listed, len(response.Cairns))
 	}
-	if lookup.calls != 1 || len(lookup.hashes) != 4 {
-		t.Fatalf("warm lookup calls=%d hashes=%v, want one four-hash batch", lookup.calls, lookup.hashes)
+	if lookup.calls != 1 || len(lookup.hashes) != 5 {
+		t.Fatalf("warm lookup calls=%d hashes=%v, want one five-hash batch", lookup.calls, lookup.hashes)
+	}
+	for _, hash := range []string{warmHash, coldHash, pendingHash, remoteHash} {
+		if got := primary.gets[manifest.Path(hash)]; got != 0 {
+			t.Fatalf("unnecessary manifest reads for %s=%d, want 0", hash, got)
+		}
+	}
+	if got := primary.has["blobs/b_warm"]; got != 0 {
+		t.Fatalf("unnecessary warm file checks=%d, want 0", got)
+	}
+	if got := primary.gets[manifest.Path(legacyHash)]; got != 1 {
+		t.Fatalf("legacy warm manifest reads=%d, want 1", got)
+	}
+	if got := primary.has["blobs/b_legacy"]; got != 1 {
+		t.Fatalf("legacy warm file checks=%d, want 1", got)
+	}
+	if got := archive.gets[nzb.StorageKey(coldHash)]; got != 1 {
+		t.Fatalf("cold NZB reads=%d, want 1", got)
+	}
+	for _, hash := range []string{warmHash, pendingHash, remoteHash} {
+		if got := archive.gets[nzb.StorageKey(hash)]; got != 0 {
+			t.Fatalf("unnecessary NZB reads for %s=%d, want 0", hash, got)
+		}
 	}
 	warm := response.Cairns[0]
 	if !warm.Cached || warm.StreamSource != "cache" || len(warm.StreamURLs) != 1 || strings.Contains(warm.StreamURLs[0].SignedURL, "/cairn/") {
@@ -182,6 +230,11 @@ func TestCairnListReportsWarmAndDirectStreamsAsCached(t *testing.T) {
 		strings.Contains(remote.StreamURLs[0].SignedURL, "/cairn/") ||
 		!strings.Contains(remote.StreamURLs[0].SignedURL, "signed://box2/blobs/b_remote") {
 		t.Fatalf("remote warm item = %+v", remote)
+	}
+	legacy := response.Cairns[4]
+	if !legacy.Cached || legacy.StreamSource != "cache" || len(legacy.StreamURLs) != 1 ||
+		strings.Contains(legacy.StreamURLs[0].SignedURL, "/cairn/") {
+		t.Fatalf("legacy warm item = %+v", legacy)
 	}
 }
 

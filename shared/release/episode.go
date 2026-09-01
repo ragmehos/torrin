@@ -1,26 +1,28 @@
 package release
 
 import (
+	"slices"
 	"strings"
 
 	tnp "github.com/torrin-app/torrent-name-parser"
 )
 
 func MatchesEpisode(title string, season, episode int) bool {
+	if season < 0 || episode <= 0 {
+		return false
+	}
 	info, err := tnp.ParseName(strings.ReplaceAll(title, ".", " "))
 	if err != nil {
 		return false
 	}
-	if info.Episode == 0 {
-		if info.Season == season {
-			return true
+	if len(info.Episodes) > 0 {
+		if !slices.Contains(info.Episodes, episode) {
+			return false
 		}
-		for _, s := range info.Seasons {
-			if s == season {
-				return true
-			}
+		if len(info.Seasons) == 0 {
+			return season == 1
 		}
-		return false
+		return slices.Contains(info.Seasons, season)
 	}
-	return info.Season == season && info.Episode == episode
+	return slices.Contains(info.Seasons, season)
 }

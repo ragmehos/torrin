@@ -5,22 +5,45 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 
 	"github.com/torrin-app/torrin/shared/auth"
+	"github.com/torrin-app/torrin/shared/cairn"
 	"github.com/torrin-app/torrin/shared/cinemeta"
 	"github.com/torrin-app/torrin/shared/georoute"
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/manifest"
 	"github.com/torrin-app/torrin/shared/storage"
+	"github.com/torrin-app/torrin/shared/stremioid"
 )
 
 type Server struct {
 	users *auth.Store
-	jobs  *jobs.Postgres
-	store *storage.Client
-	meta  *cinemeta.Client
+	jobs  jobRepository
+	store streamStore
+	meta  titleResolver
+}
+
+type jobRepository interface {
+	jobs.CachedLookup
+	RecordView(ctx context.Context, infoHash, userID string) (bool, error)
+	ListByInfoHash(ctx context.Context, infoHash string) ([]*jobs.Job, error)
+	ListByIMDB(ctx context.Context, imdbID string) ([]*jobs.Job, error)
+	ListUserByosByIMDB(ctx context.Context, userID, imdbID string) ([]*jobs.Job, error)
+	ListByTitleNorm(ctx context.Context, norm string) ([]*jobs.Job, error)
+}
+
+type streamStore interface {
+	GetBytes(ctx context.Context, key string) ([]byte, error)
+	SignURLNode(node, path string, expiry time.Duration) string
+	SignURLNodeUser(node, path, userID string, expiry time.Duration) string
+}
+
+type titleResolver interface {
+	Title(ctx context.Context, imdbID, contentType string) (string, error)
 }
 
 func New(users *auth.Store, j *jobs.Postgres, store *storage.Client) *Server {
@@ -67,52 +90,58 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	byos := s.userHasBYOS(r.Context(), user.ID)
-	imdbID, infoHash := parseID(contentID)
-	var streams []map[string]any
-	if infoHash != "" {
-		streams = append(streams, s.byHash(r, infoHash, user.ID, byos)...)
+	id := stremioid.Parse(contentID)
+	if !streamTargetMatchesType(r.PathValue("type"), id) {
+		writeJSON(w, 200, empty)
+		return
 	}
-	if imdbID != "" {
-		streams = append(streams, s.byLibrary(r, r.PathValue("type"), imdbID, user.ID, byos)...)
+	var streams []map[string]any
+	if id.InfoHash != "" {
+		streams = append(streams, s.byHash(r, id.InfoHash, user.ID)...)
+	}
+	if id.IMDBID != "" {
+		streams = append(streams, s.byLibrary(r, r.PathValue("type"), id, user.ID, byos)...)
 	}
 
 	if len(streams) == 0 {
 		writeJSON(w, 200, empty)
 		return
 	}
-	if infoHash != "" {
-		s.jobs.RecordView(r.Context(), infoHash, user.ID)
+	if id.InfoHash != "" {
+		s.jobs.RecordView(r.Context(), id.InfoHash, user.ID)
 	}
 	slog.Info("stremio: served", "user", user.ID, "id", contentID, "streams", len(streams))
 	writeJSON(w, 200, map[string]any{"streams": streams})
 }
 
-func parseID(contentID string) (imdbID, infoHash string) {
-	candidate := strings.Split(contentID, ":")[0]
-	if strings.HasPrefix(candidate, "tt") {
-		return strings.TrimPrefix(candidate, "tt"), ""
-	}
-	if len(candidate) == 40 {
-		return "", strings.ToLower(candidate)
-	}
-	return "", ""
-}
-
-func (s *Server) byHash(r *http.Request, infoHash, userID string, byos bool) []map[string]any {
+func (s *Server) byHash(r *http.Request, infoHash, userID string) []map[string]any {
 	data, err := s.store.GetBytes(r.Context(), manifest.Path(infoHash))
-	if err != nil {
-		return nil
+	if err == nil {
+		man, parseErr := manifest.Parse(data)
+		if parseErr == nil && len(man.Files) > 0 {
+			return s.entries(r, infoHash, userID, "", false, manifestFiles(man))
+		}
+		if parseErr != nil {
+			slog.Warn("stremio: bad manifest", "hash", infoHash, "err", parseErr)
+		}
 	}
-	man, err := manifest.Parse(data)
-	if err != nil {
-		slog.Warn("stremio: bad manifest", "hash", infoHash, "err", err)
-		return nil
+
+	if warm, ok := s.cachedJobs(r.Context(), []string{infoHash})[infoHash]; ok {
+		if files := jobs.FilesForEpisode(warm, warm.Files, 0, 0); len(files) > 0 {
+			return s.entries(r, infoHash, userID, warm.Node, false, files)
+		}
 	}
-	var out []map[string]any
-	for _, f := range man.Files {
-		out = append(out, entry(f.FileName, s.streamURL(r, infoHash, f.DirectURL, userID, byos, f.Enc)))
+	candidates, _ := s.jobs.ListByInfoHash(r.Context(), infoHash)
+	for _, candidate := range candidates {
+		if candidate.Status != jobs.StatusComplete && candidate.Status != jobs.StatusSeeding {
+			continue
+		}
+		files := jobs.FilesForEpisode(candidate, candidate.Files, 0, 0)
+		if hasCairnFile(infoHash, files) {
+			return s.entries(r, infoHash, userID, "", false, files)
+		}
 	}
-	return out
+	return nil
 }
 
 func (s *Server) userHasBYOS(ctx context.Context, userID string) bool {
@@ -120,59 +149,168 @@ func (s *Server) userHasBYOS(ctx context.Context, userID string) bool {
 	return err == nil && creds != nil && creds.Enabled && creds.IsRclone()
 }
 
-func (s *Server) streamURL(r *http.Request, infoHash, key, userID string, byos, enc bool) string {
+func (s *Server) streamURL(r *http.Request, infoHash, key, userID, node string, byos, enc bool) string {
 	var u string
-	if byos {
-		u = s.store.SignURLNodeUser("", key, userID, 24*time.Hour) + "&byos=1"
+	if _, _, _, direct := cairn.ParseStreamPath(key); direct {
+		u = s.store.SignURLNodeUser("", key, userID, 24*time.Hour)
+	} else if byos {
+		u = s.store.SignURLNodeUser(node, key, userID, 24*time.Hour) + "&byos=1"
 	} else {
-		u = s.store.SignURLNode(s.jobs.NodeForInfoHash(r.Context(), infoHash), key, 24*time.Hour)
+		u = s.store.SignURLNode(node, key, 24*time.Hour)
 	}
 	u += manifest.StreamQuery(infoHash, enc)
 	return georoute.URL(r, u)
 }
 
-func (s *Server) byLibrary(r *http.Request, contentType, imdbID, userID string, byos bool) []map[string]any {
+func (s *Server) byLibrary(r *http.Request, contentType string, id stremioid.ID, userID string, byos bool) []map[string]any {
 	ctx := r.Context()
-	seen := map[string]bool{}
-	var out []map[string]any
-	add := func(list []*jobs.Job) {
+	order := []string{}
+	grouped := map[string][]libraryCandidate{}
+	add := func(list []*jobs.Job, fromBYOS bool) {
 		for _, j := range list {
-			if seen[j.InfoHash] {
+			if j == nil || j.InfoHash == "" {
 				continue
 			}
-			seen[j.InfoHash] = true
-			for i, f := range j.Files {
-				key := manifest.ResolveKey(j.InfoHash, i, f.Key, f.Name)
-				out = append(out, entry(f.Name, s.streamURL(r, j.InfoHash, key, userID, byos, f.Enc)))
+			if _, exists := grouped[j.InfoHash]; !exists {
+				order = append(order, j.InfoHash)
+			}
+			grouped[j.InfoHash] = append(grouped[j.InfoHash], libraryCandidate{job: j, byos: fromBYOS})
+		}
+	}
+
+	byImdb, _ := s.jobs.ListByIMDB(ctx, id.IMDBID)
+	add(byImdb, false)
+
+	if byos {
+		byosOwn, _ := s.jobs.ListUserByosByIMDB(ctx, userID, id.IMDBID)
+		add(byosOwn, true)
+	}
+
+	if s.meta != nil {
+		if title, err := s.meta.Title(ctx, id.IMDBID, contentType); err == nil {
+			if norm := jobs.NormTitle(title); norm != "" {
+				byTitle, _ := s.jobs.ListByTitleNorm(ctx, norm)
+				add(byTitle, false)
 			}
 		}
 	}
 
-	byImdb, _ := s.jobs.ListByIMDB(ctx, imdbID)
-	add(byImdb)
-
-	if byos {
-		byosOwn, _ := s.jobs.ListUserByosByIMDB(ctx, userID, imdbID)
-		add(byosOwn)
-	}
-
-	if title, err := s.meta.Title(ctx, imdbID, contentType); err == nil {
-		if norm := jobs.NormTitle(title); norm != "" {
-			byTitle, _ := s.jobs.ListByTitleNorm(ctx, norm)
-			add(byTitle)
+	warmByHash := s.cachedJobs(ctx, order)
+	var out []map[string]any
+	for _, hash := range order {
+		if warm := warmByHash[hash]; warm != nil {
+			if files := libraryFiles(warm, id); len(files) > 0 {
+				out = append(out, s.entries(r, hash, userID, warm.Node, false, files)...)
+				continue
+			}
 		}
+		selected, files, ok := selectLibraryCandidate(grouped[hash], id, byos)
+		if !ok {
+			continue
+		}
+		out = append(out, s.entries(r, hash, userID, selected.job.Node, selected.byos, files)...)
 	}
 	return out
 }
 
-func entry(title, url string) map[string]any {
+type libraryCandidate struct {
+	job  *jobs.Job
+	byos bool
+}
+
+func selectLibraryCandidate(candidates []libraryCandidate, id stremioid.ID, preferBYOS bool) (libraryCandidate, []jobs.File, bool) {
+	for _, wantBYOS := range []bool{true, false} {
+		if wantBYOS && !preferBYOS {
+			continue
+		}
+		for _, candidate := range candidates {
+			if candidate.byos != wantBYOS {
+				continue
+			}
+			if files := libraryFiles(candidate.job, id); len(files) > 0 {
+				return candidate, files, true
+			}
+		}
+	}
+	return libraryCandidate{}, nil, false
+}
+
+func manifestFiles(man *manifest.Manifest) []jobs.File {
+	files := make([]jobs.File, len(man.Files))
+	for i, file := range man.Files {
+		files[i] = jobs.File{Index: i, Name: file.FileName, Size: file.FileSize, Key: file.DirectURL, Enc: file.Enc}
+	}
+	return files
+}
+
+func hasCairnFile(infoHash string, files []jobs.File) bool {
+	for _, file := range files {
+		key := manifest.ResolveKey(infoHash, file.Index, file.Key, file.Name)
+		if _, _, _, ok := cairn.ParseStreamPath(key); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) entries(r *http.Request, infoHash, userID, node string, byos bool, files []jobs.File) []map[string]any {
+	out := make([]map[string]any, len(files))
+	for i, file := range files {
+		key := manifest.ResolveKey(infoHash, file.Index, file.Key, file.Name)
+		streamURL := s.streamURL(r, infoHash, key, userID, node, byos, file.Enc)
+		out[i] = entry(file.Name, streamURL, infoHash, file.Size)
+	}
+	return out
+}
+
+func (s *Server) cachedJobs(ctx context.Context, hashes []string) map[string]*jobs.Job {
+	if s.jobs == nil || len(hashes) == 0 {
+		return nil
+	}
+	byHash, err := s.jobs.CachedByHashes(ctx, hashes)
+	if err != nil {
+		return nil
+	}
+	return byHash
+}
+
+func libraryFiles(j *jobs.Job, id stremioid.ID) []jobs.File {
+	return jobs.FilesForEpisode(j, j.Files, id.Season, id.Episode)
+}
+
+func streamTargetMatchesType(contentType string, id stremioid.ID) bool {
+	if id.InfoHash != "" {
+		return contentType == "movie" || contentType == "series"
+	}
+	switch contentType {
+	case "movie":
+		return id.IMDBID != "" && !id.IsEpisode()
+	case "series":
+		return id.IsEpisode()
+	default:
+		return false
+	}
+}
+
+func entry(title, streamURL, infoHash string, size int64) map[string]any {
+	filename := path.Base(strings.ReplaceAll(title, `\`, "/"))
+	parsedURL, _ := url.Parse(streamURL)
+	hints := map[string]any{
+		"filename":    filename,
+		"notWebReady": parsedURL.Scheme != "https" || !strings.EqualFold(path.Ext(filename), ".mp4"),
+	}
+	if infoHash != "" {
+		hints["bingeGroup"] = "torrin:" + strings.ToLower(infoHash)
+	}
+	if size > 0 {
+		hints["videoSize"] = size
+	}
 	return map[string]any{
-		"name":  "Torrin",
-		"title": title,
-		"url":   url,
-		"behaviorHints": map[string]any{
-			"notWebReady": strings.HasSuffix(title, ".mkv"),
-		},
+		"name":          "Torrin",
+		"title":         filename,
+		"description":   filename,
+		"url":           streamURL,
+		"behaviorHints": hints,
 	}
 }
 

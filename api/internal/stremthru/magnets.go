@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"html"
 	"net/http"
-	"strings"
 
 	"github.com/torrin-app/torrin/shared/auth"
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/keyed"
 	"github.com/torrin-app/torrin/shared/magnet"
 	"github.com/torrin-app/torrin/shared/plans"
+	"github.com/torrin-app/torrin/shared/stremioid"
 )
 
 func (h *Handler) listMagnets(w http.ResponseWriter, r *http.Request, user *auth.User) {
@@ -58,6 +58,7 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 		return
 	}
 	defer keyed.Lock(infoHash)()
+	streamID := stremioid.Parse(r.URL.Query().Get("sid"))
 
 	source, mag := jobs.SourceTorrent, req.Magnet
 	hdTitle := ""
@@ -75,17 +76,28 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 	cache, cached := h.cachedJobFiles(r.Context(), infoHash)
 	plan, _ := plans.Get(user.PlanID)
 
+	if streamID.IsEpisode() {
+		if siblings, listErr := h.Jobs.ListByInfoHash(r.Context(), infoHash); listErr == nil {
+			if reusable := reusableStreamJob(siblings, user.ID, streamID); reusable != nil {
+				stJSON(w, 200, map[string]any{"data": h.magnetData(r.Context(), reusable)})
+				return
+			}
+		}
+	}
+
 	existing, err := h.Jobs.GetByInfoHash(r.Context(), infoHash)
 	if err == nil && existing != nil && existing.Status != jobs.StatusFailed && existing.Status != jobs.StatusEvicted {
-		if existing.UserID == user.ID {
+		if existing.UserID == user.ID && sameStreamTarget(existing, streamID) {
 			stJSON(w, 200, map[string]any{"data": h.magnetData(r.Context(), existing)})
 			return
 		}
 		linked := &jobs.Job{
 			UserID: user.ID, InfoHash: infoHash, Name: existing.Name, Magnet: mag,
 			Source: source, Status: existing.Status, IMDBID: existing.IMDBID,
+			Season: existing.Season, Episode: existing.Episode,
 			Files: existing.Files, FileSize: existing.FileSize, Node: existing.Node,
 		}
+		applyStreamTarget(linked, streamID)
 		activeLink := existing.Status.Active()
 		if activeLink && !h.Slots.Acquire(r.Context(), user.ID, plan) {
 			stError(w, 429, "slot limit reached")
@@ -120,7 +132,7 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 	}
 	job := &jobs.Job{
 		UserID: user.ID, InfoHash: infoHash, Magnet: mag, Name: name, FileSize: hdSize,
-		Source: source, IMDBID: imdbFromSID(r.URL.Query().Get("sid")),
+		Source: source, IMDBID: streamID.IMDBID, Season: streamID.Season, Episode: streamID.Episode,
 		Status: jobs.StatusPending, MaxBytes: plan.MaxTorrentBytes, Priority: plan.Priority,
 	}
 	if cached {
@@ -179,14 +191,37 @@ func coldPullBlocked(ctx context.Context, c coldPullChecker, userID string, perH
 
 func displayName(m string) string { return magnet.DisplayName(m) }
 
-func imdbFromSID(sid string) string {
-	if !strings.HasPrefix(sid, "tt") {
-		return ""
+func sameStreamTarget(j *jobs.Job, id stremioid.ID) bool {
+	if id.IMDBID == "" {
+		return true
 	}
-	if i := strings.Index(sid, ":"); i > 0 {
-		sid = sid[:i]
+	if j.IMDBID != "" && j.IMDBID != id.IMDBID {
+		return false
 	}
-	return strings.TrimPrefix(sid, "tt")
+	if id.IsEpisode() {
+		return j.IMDBID == id.IMDBID && j.Season == id.Season && j.Episode == id.Episode
+	}
+	return j.Season == 0 && j.Episode == 0
+}
+
+func reusableStreamJob(candidates []*jobs.Job, userID string, id stremioid.ID) *jobs.Job {
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.UserID != userID || candidate.Status == jobs.StatusFailed || candidate.Status == jobs.StatusEvicted {
+			continue
+		}
+		if sameStreamTarget(candidate, id) {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func applyStreamTarget(j *jobs.Job, id stremioid.ID) {
+	if id.IMDBID != "" {
+		j.IMDBID = id.IMDBID
+		j.Season = id.Season
+		j.Episode = id.Episode
+	}
 }
 
 func (h *Handler) canUsenet(ctx context.Context, user *auth.User) bool {

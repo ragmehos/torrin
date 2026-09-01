@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/moistari/rls"
-	tnp "github.com/torrin-app/torrent-name-parser"
+	"github.com/torrin-app/torrin/shared/release"
 )
 
 func normalizeTitle(s string) string {
@@ -57,11 +57,8 @@ func Verify(results []Result, imdbID, title string, season, episode int) []Resul
 		if !TitleMatch(results[i].Title, title) {
 			continue
 		}
-		if episode > 0 {
-			info, _ := tnp.ParseName(strings.ReplaceAll(results[i].Title, ".", " "))
-			if info.Season != season || info.Episode != episode {
-				continue
-			}
+		if episode > 0 && !release.MatchesEpisode(results[i].Title, season, episode) {
+			continue
 		}
 		out = append(out, results[i])
 	}

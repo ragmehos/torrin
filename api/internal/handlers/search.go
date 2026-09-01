@@ -32,7 +32,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		web.WriteError(w, 400, "imdb (e.g. tt0816692) or title is required")
 		return
 	}
-	wantEpisode := season > 0 && episode > 0
+	wantEpisode := season >= 0 && episode > 0
 
 	seen := map[string]bool{}
 	out := []searchResult{}
@@ -122,26 +122,7 @@ type searchResult struct {
 }
 
 func episodeMatch(j *jobs.Job, fileName string, season, episode int) bool {
-	if j.Season > 0 || j.Episode > 0 {
-		return j.Season == season && j.Episode == episode
-	}
-	return fileMatchesEpisode(fileName, season, episode)
-}
-
-func fileMatchesEpisode(fileName string, season, episode int) bool {
-	info, err := tnp.ParseName(strings.ReplaceAll(fileName, ".", " "))
-	if err != nil || info.Episode != episode {
-		return false
-	}
-	if len(info.Seasons) == 0 {
-		return season == 1
-	}
-	for _, sn := range info.Seasons {
-		if sn == season {
-			return true
-		}
-	}
-	return false
+	return jobs.MatchesEpisodeFile(j, fileName, season, episode, j != nil && len(j.Files) == 1)
 }
 
 func yearMatches(releaseName string, year int) bool {

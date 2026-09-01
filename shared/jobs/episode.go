@@ -2,8 +2,9 @@ package jobs
 
 import (
 	"slices"
+	"strings"
 
-	ptt "github.com/MunifTanjim/go-ptt"
+	tnp "github.com/torrin-app/torrent-name-parser"
 )
 
 // MatchesEpisodeFile applies job metadata when it is available, but prefers
@@ -15,8 +16,8 @@ func MatchesEpisodeFile(j *Job, fileName string, season, episode int) bool {
 		return true
 	}
 
-	info := ptt.Parse(fileName)
-	if info.Error() == nil && len(info.Episodes) > 0 {
+	info, err := tnp.ParseName(strings.ReplaceAll(fileName, ".", " "))
+	if err == nil && len(info.Episodes) > 0 {
 		if !slices.Contains(info.Episodes, episode) {
 			return false
 		}

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -90,9 +91,14 @@ func (s *Server) cairnList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]cairnListItem, len(items))
+	hashes := make([]string, len(items))
+	for i := range items {
+		hashes[i] = items[i].InfoHash
+	}
+	warmByHash := s.cairnCachedJobs(r.Context(), hashes)
 	for i, item := range items {
 		out[i].CairnItem = item
-		if streams, ok := s.cachedCairnStreams(r, user.ID, item.InfoHash); ok {
+		if streams, ok := s.cachedCairnStreams(r, user.ID, item.InfoHash, warmByHash[item.InfoHash]); ok {
 			out[i].Cached, out[i].StreamSource, out[i].StreamURLs = true, "cache", streams
 			continue
 		}
@@ -109,7 +115,30 @@ func (s *Server) cairnList(w http.ResponseWriter, r *http.Request) {
 	web.WriteJSON(w, 200, map[string]any{"cairns": out})
 }
 
-func (s *Server) cachedCairnStreams(r *http.Request, userID, hash string) ([]jobs.Stream, bool) {
+func (s *Server) cairnCachedLookup() jobs.CachedLookup {
+	if s.CachedJobs != nil {
+		return s.CachedJobs
+	}
+	if s.JobsPG != nil {
+		return s.JobsPG
+	}
+	return nil
+}
+
+func (s *Server) cairnCachedJobs(ctx context.Context, hashes []string) map[string]*jobs.Job {
+	lookup := s.cairnCachedLookup()
+	if lookup == nil || len(hashes) == 0 {
+		return nil
+	}
+	byHash, err := lookup.CachedByHashes(ctx, hashes)
+	if err != nil {
+		slog.Warn("cairn: warm cache lookup failed", "count", len(hashes), "err", err)
+		return nil
+	}
+	return byHash
+}
+
+func (s *Server) cachedCairnStreams(r *http.Request, userID, hash string, remote *jobs.Job) ([]jobs.Stream, bool) {
 	if manifest.Playable(r.Context(), s.Store, hash) {
 		data, err := s.Store.GetBytes(r.Context(), manifest.Path(hash))
 		if err == nil {
@@ -124,19 +153,10 @@ func (s *Server) cachedCairnStreams(r *http.Request, userID, hash string) ([]job
 			}
 		}
 	}
+	return s.nodeCairnStreams(r, hash, remote)
+}
 
-	lookup := s.CachedJobs
-	if lookup == nil && s.JobsPG != nil {
-		lookup = s.JobsPG
-	}
-	if lookup == nil {
-		return nil, false
-	}
-	byHash, err := lookup.CachedByHashes(r.Context(), []string{hash})
-	if err != nil {
-		return nil, false
-	}
-	job := byHash[hash]
+func (s *Server) nodeCairnStreams(r *http.Request, hash string, job *jobs.Job) ([]jobs.Stream, bool) {
 	if job == nil || job.Node == "" || len(job.Files) == 0 {
 		return nil, false
 	}
@@ -207,6 +227,29 @@ func (s *Server) cairnRestore(w http.ResponseWriter, r *http.Request) {
 		job.StreamURLs = s.signStreams(job, r)
 		web.WriteJSON(w, 200, job)
 		return
+	}
+	if warm := s.cairnCachedJobs(r.Context(), []string{hash})[hash]; warm != nil {
+		if streams, playable := s.nodeCairnStreams(r, hash, warm); playable {
+			response := *warm
+			if warm.UserID != user.ID {
+				linked := &jobs.Job{
+					UserID: user.ID, InfoHash: hash, Name: warm.Name, Source: jobs.SourceUsenet,
+					Status: jobs.StatusComplete, Files: append([]jobs.File(nil), warm.Files...),
+					FileSize: warm.FileSize, Node: warm.Node, IMDBID: warm.IMDBID,
+				}
+				if linked.Name == "" {
+					linked.Name = name
+				}
+				if err := s.Jobs.Create(r.Context(), linked); err != nil {
+					web.WriteError(w, 500, "could not link warm cache")
+					return
+				}
+				response = *linked
+			}
+			response.StreamURLs = streams
+			web.WriteJSON(w, 200, &response)
+			return
+		}
 	}
 	if existing, err := s.Jobs.GetByInfoHash(r.Context(), hash); err == nil && existing != nil && existing.UserID == user.ID && existing.Status.Active() {
 		web.WriteJSON(w, 200, existing)

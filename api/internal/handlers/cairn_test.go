@@ -37,6 +37,18 @@ func (f fakeCachedLookup) CachedByHashes(_ context.Context, hashes []string) (ma
 	return out, nil
 }
 
+type recordingCachedLookup struct {
+	jobs   fakeCachedLookup
+	calls  int
+	hashes []string
+}
+
+func (f *recordingCachedLookup) CachedByHashes(ctx context.Context, hashes []string) (map[string]*jobs.Job, error) {
+	f.calls++
+	f.hashes = append(f.hashes, hashes...)
+	return f.jobs.CachedByHashes(ctx, hashes)
+}
+
 func (f *fakeCairns) GetCairnArchive(_ context.Context, hash string) (string, string, bool) {
 	for _, item := range f.items {
 		if item.InfoHash == hash && item.Archived {
@@ -116,18 +128,19 @@ func TestCairnListReportsWarmAndDirectStreamsAsCached(t *testing.T) {
 		{InfoHash: pendingHash, Name: "Pending", Archived: false},
 		{InfoHash: remoteHash, Name: "Remote", Archived: true},
 	}}
+	lookup := &recordingCachedLookup{jobs: fakeCachedLookup{
+		coldHash: {
+			InfoHash: coldHash, Name: "Cairn Record", Status: jobs.StatusComplete,
+			Files: []jobs.File{{Index: 0, Name: "cold.mkv", Size: coldPlainSize, Key: cairn.StreamPath(coldHash, 0, "cold.mkv")}},
+		},
+		remoteHash: {
+			InfoHash: remoteHash, Name: "Remote", Status: jobs.StatusComplete, Node: "box2",
+			Files: []jobs.File{{Index: 0, Name: "remote.mkv", Size: 4321, Key: "blobs/b_remote"}},
+		},
+	}}
 	s := New(Deps{
 		Jobs: &fakeRepo{}, Store: primary, Cairns: repo, CairnStore: archive,
-		CairnCipher: cipher, CairnDirect: true, CachedJobs: fakeCachedLookup{
-			coldHash: {
-				InfoHash: coldHash, Name: "Cairn Record", Status: jobs.StatusComplete,
-				Files: []jobs.File{{Index: 0, Name: "cold.mkv", Size: coldPlainSize, Key: cairn.StreamPath(coldHash, 0, "cold.mkv")}},
-			},
-			remoteHash: {
-				InfoHash: remoteHash, Name: "Remote", Status: jobs.StatusComplete, Node: "box2",
-				Files: []jobs.File{{Index: 0, Name: "remote.mkv", Size: 4321, Key: "blobs/b_remote"}},
-			},
-		},
+		CairnCipher: cipher, CairnDirect: true, CachedJobs: lookup,
 	})
 	r := httptest.NewRequest("GET", "/api/cairn", nil)
 	r = r.WithContext(context.WithValue(r.Context(), middleware.UserContextKey, &auth.User{ID: "u1"}))
@@ -144,6 +157,9 @@ func TestCairnListReportsWarmAndDirectStreamsAsCached(t *testing.T) {
 	}
 	if repo.listed != "u1" || len(response.Cairns) != 4 {
 		t.Fatalf("listed=%q items=%d", repo.listed, len(response.Cairns))
+	}
+	if lookup.calls != 1 || len(lookup.hashes) != 4 {
+		t.Fatalf("warm lookup calls=%d hashes=%v, want one four-hash batch", lookup.calls, lookup.hashes)
 	}
 	warm := response.Cairns[0]
 	if !warm.Cached || warm.StreamSource != "cache" || len(warm.StreamURLs) != 1 || strings.Contains(warm.StreamURLs[0].SignedURL, "/cairn/") {
@@ -199,6 +215,30 @@ func TestCairnRestoreKeepsWarmAndColdBehavior(t *testing.T) {
 		s.cairnRestore(w, request())
 		if w.Code != 202 || len(repo.created) != 1 || repo.created[0].Status != jobs.StatusPending || len(pub.published) != 1 {
 			t.Fatalf("code=%d created=%+v published=%v", w.Code, repo.created, pub.published)
+		}
+	})
+
+	t.Run("remote warm is immediate", func(t *testing.T) {
+		repo, pub := &fakeRepo{}, &fakePub{}
+		lookup := fakeCachedLookup{hash: {
+			UserID: "other", InfoHash: hash, Name: "Remote Movie", Status: jobs.StatusComplete, Node: "box2", FileSize: 4321,
+			Files: []jobs.File{{Index: 0, Name: "remote.mkv", Size: 4321, Key: "blobs/b_remote"}},
+		}}
+		s := New(Deps{
+			Jobs: repo, Store: &fakeStore{}, Cairns: repository, CachedJobs: lookup,
+			Bus: pub, Slots: middleware.NewSlotTracker(repo),
+		})
+		w := httptest.NewRecorder()
+		s.cairnRestore(w, request())
+		if w.Code != 200 || len(repo.created) != 1 || len(pub.published) != 0 {
+			t.Fatalf("code=%d created=%+v published=%v body=%s", w.Code, repo.created, pub.published, w.Body.String())
+		}
+		created := repo.created[0]
+		if created.Status != jobs.StatusComplete || created.Node != "box2" || created.UserID != "u1" {
+			t.Fatalf("linked warm job = %+v", created)
+		}
+		if !strings.Contains(w.Body.String(), "signed://box2/blobs/b_remote") {
+			t.Fatalf("remote warm response = %s", w.Body.String())
 		}
 	})
 }

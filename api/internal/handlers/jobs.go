@@ -74,7 +74,18 @@ func (s *Server) submitMagnet(w http.ResponseWriter, r *http.Request, infoHash, 
 	plan := middleware.GetPlan(r)
 	defer lockGrab(infoHash)()
 
-	// 1. Already cached → instant.
+	// 1. The account row is keyed by user + content hash. Reuse it before
+	// consulting cache state so replay can never manufacture another row.
+	siblings, _ := s.Jobs.ListByInfoHash(r.Context(), infoHash)
+	if existing := userJobForHash(siblings, user.ID); existing != nil {
+		if !existing.Status.Active() {
+			existing.StreamURLs = s.signStreams(existing, r)
+		}
+		web.WriteJSON(w, 200, existing)
+		return
+	}
+
+	// 2. Already cached → instant.
 	if manifest.Playable(r.Context(), s.Store, infoHash) {
 		job, err := s.buildCachedJob(r.Context(), infoHash, magnet, user.ID, source)
 		if err != nil {
@@ -86,15 +97,8 @@ func (s *Server) submitMagnet(w http.ResponseWriter, r *http.Request, infoHash, 
 		return
 	}
 
-	// 2. Dedup against an existing job for this hash.
+	// 3. Link another user's reusable physical cache to this account.
 	if existing, err := s.Jobs.GetByInfoHash(r.Context(), infoHash); err == nil && existing != nil && existing.Status != jobs.StatusFailed && existing.Status != jobs.StatusEvicted {
-		if existing.UserID == user.ID {
-			if !existing.Status.Active() {
-				existing.StreamURLs = s.signStreams(existing, r)
-			}
-			web.WriteJSON(w, 200, existing)
-			return
-		}
 		linked := &jobs.Job{
 			UserID: user.ID, InfoHash: infoHash, Name: existing.Name, Magnet: magnet,
 			Source: source, Status: existing.Status, Files: existing.Files, FileSize: existing.FileSize, Node: existing.Node,
@@ -106,11 +110,13 @@ func (s *Server) submitMagnet(w http.ResponseWriter, r *http.Request, infoHash, 
 				writeQueueError(w, err, s.Slots.MaxQueued())
 				return
 			}
-			linked.Node = existing.Node
-			if disposition == jobs.AdmissionAdmitted && existing.Status != jobs.StatusQueued {
-				linked.Status = existing.Status
+			if disposition != jobs.AdmissionExisting {
+				linked.Node = existing.Node
+				if disposition == jobs.AdmissionAdmitted && existing.Status != jobs.StatusQueued {
+					linked.Status = existing.Status
+				}
+				s.Jobs.Update(r.Context(), linked)
 			}
-			s.Jobs.Update(r.Context(), linked)
 		} else if err := s.Jobs.Create(r.Context(), linked); err != nil {
 			web.WriteError(w, 500, "could not start this download")
 			return

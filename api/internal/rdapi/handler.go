@@ -112,12 +112,12 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 	defer keyed.Lock(infoHash)()
 	cached := manifest.Playable(r.Context(), h.Store, infoHash)
 	plan, _ := plans.Get(user.PlanID)
+	if existing, err := h.Jobs.GetByUserInfoHash(r.Context(), user.ID, infoHash); err == nil && existing != nil {
+		writeJSON(w, 201, map[string]any{"id": existing.ID, "uri": "/rest/1.0/torrents/info/" + existing.ID})
+		return
+	}
 
 	if existing, err := h.Jobs.GetByInfoHash(r.Context(), infoHash); err == nil && existing != nil && existing.Status != jobs.StatusFailed {
-		if existing.UserID == user.ID {
-			writeJSON(w, 201, map[string]any{"id": existing.ID, "uri": "/rest/1.0/torrents/info/" + existing.ID})
-			return
-		}
 		linked := &jobs.Job{
 			UserID: user.ID, InfoHash: infoHash, Magnet: magnet, Name: existing.Name,
 			Source: jobs.SourceTorrent, Status: existing.Status, IMDBID: existing.IMDBID,
@@ -130,11 +130,13 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 				rdQueueError(w, err)
 				return
 			}
-			linked.Node = existing.Node
-			if disposition == jobs.AdmissionAdmitted && existing.Status != jobs.StatusQueued {
-				linked.Status = existing.Status
+			if disposition != jobs.AdmissionExisting {
+				linked.Node = existing.Node
+				if disposition == jobs.AdmissionAdmitted && existing.Status != jobs.StatusQueued {
+					linked.Status = existing.Status
+				}
+				h.Jobs.Update(r.Context(), linked)
 			}
-			h.Jobs.Update(r.Context(), linked)
 		} else if err := h.Jobs.Create(r.Context(), linked); err != nil {
 			writeRDError(w, 500, 20, "could not create download")
 			return

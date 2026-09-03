@@ -6,7 +6,6 @@ import (
 	"errors"
 	"html"
 	"net/http"
-	"strings"
 
 	"github.com/torrin-app/torrin/shared/auth"
 	"github.com/torrin-app/torrin/shared/events"
@@ -34,7 +33,12 @@ func (h *Handler) getMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 	if job.Status == jobs.StatusComplete || job.Status == jobs.StatusSeeding {
 		h.Jobs.RecordView(r.Context(), job.InfoHash, user.ID)
 	}
-	stJSON(w, 200, map[string]any{"data": h.magnetData(r.Context(), job)})
+	target, validTarget := playbackTarget(r.URL.Query().Get("sid"))
+	if !validTarget {
+		stError(w, 400, "invalid series sid")
+		return
+	}
+	stJSON(w, 200, map[string]any{"data": h.magnetDataForTarget(r.Context(), job, target)})
 }
 
 func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.User) {
@@ -60,6 +64,11 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 		return
 	}
 	defer keyed.Lock(infoHash)()
+	target, validTarget := playbackTarget(r.URL.Query().Get("sid"))
+	if !validTarget {
+		stError(w, 400, "invalid series sid")
+		return
+	}
 
 	source, mag := jobs.SourceTorrent, req.Magnet
 	hdTitle := ""
@@ -77,16 +86,26 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 	cache, cached := h.cachedJobFiles(r.Context(), infoHash)
 	plan, _ := plans.Get(user.PlanID)
 
+	// A job is the user's account record for the whole pack. Episode selection
+	// is request-scoped and must never create another row.
+	if owned, ownedErr := h.Jobs.GetByUserInfoHash(r.Context(), user.ID, infoHash); ownedErr == nil && owned != nil {
+		if target.IMDBID != "" && owned.IMDBID == "" {
+			h.Jobs.SetIMDB(r.Context(), infoHash, target.IMDBID)
+			owned.IMDBID = target.IMDBID
+		}
+		stJSON(w, 200, map[string]any{"data": h.magnetDataForTarget(r.Context(), owned, target)})
+		return
+	}
+
 	existing, err := h.Jobs.GetByInfoHash(r.Context(), infoHash)
 	if err == nil && existing != nil && existing.Status != jobs.StatusFailed && existing.Status != jobs.StatusEvicted {
-		if existing.UserID == user.ID {
-			stJSON(w, 200, map[string]any{"data": h.magnetData(r.Context(), existing)})
-			return
-		}
 		linked := &jobs.Job{
 			UserID: user.ID, InfoHash: infoHash, Name: existing.Name, Magnet: mag,
 			Source: source, Status: existing.Status, IMDBID: existing.IMDBID,
 			Files: existing.Files, FileSize: existing.FileSize, Node: existing.Node,
+		}
+		if target.IMDBID != "" {
+			linked.IMDBID = target.IMDBID
 		}
 		activeLink := existing.Status.Active()
 		if activeLink {
@@ -95,16 +114,18 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 				stQueueError(w, err)
 				return
 			}
-			linked.Node = existing.Node
-			if disposition == jobs.AdmissionAdmitted && existing.Status != jobs.StatusQueued {
-				linked.Status = existing.Status
+			if disposition != jobs.AdmissionExisting {
+				linked.Node = existing.Node
+				if disposition == jobs.AdmissionAdmitted && existing.Status != jobs.StatusQueued {
+					linked.Status = existing.Status
+				}
+				h.Jobs.Update(r.Context(), linked)
 			}
-			h.Jobs.Update(r.Context(), linked)
 		} else if err := h.Jobs.Create(r.Context(), linked); err != nil {
 			stError(w, 500, "could not create download")
 			return
 		}
-		stJSON(w, 200, map[string]any{"data": h.magnetData(r.Context(), linked)})
+		stJSON(w, 200, map[string]any{"data": h.magnetDataForTarget(r.Context(), linked, target)})
 		return
 	}
 
@@ -124,7 +145,7 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 	}
 	job := &jobs.Job{
 		UserID: user.ID, InfoHash: infoHash, Magnet: mag, Name: name, FileSize: hdSize,
-		Source: source, IMDBID: imdbFromSID(r.URL.Query().Get("sid")),
+		Source: source, IMDBID: target.IMDBID,
 		Status: jobs.StatusPending, MaxBytes: plan.MaxTorrentBytes, Priority: plan.Priority,
 	}
 	if cached {
@@ -149,7 +170,7 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 			h.assign(job)
 		}
 	}
-	stJSON(w, 200, map[string]any{"data": h.magnetData(r.Context(), job)})
+	stJSON(w, 200, map[string]any{"data": h.magnetDataForTarget(r.Context(), job, target)})
 }
 
 func (h *Handler) deleteMagnet(w http.ResponseWriter, r *http.Request, user *auth.User) {
@@ -200,16 +221,6 @@ func stQueueError(w http.ResponseWriter, err error) {
 		return
 	}
 	stError(w, 500, "could not queue download")
-}
-
-func imdbFromSID(sid string) string {
-	if !strings.HasPrefix(sid, "tt") {
-		return ""
-	}
-	if i := strings.Index(sid, ":"); i > 0 {
-		sid = sid[:i]
-	}
-	return strings.TrimPrefix(sid, "tt")
 }
 
 func (h *Handler) canUsenet(ctx context.Context, user *auth.User) bool {

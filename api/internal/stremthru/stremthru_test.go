@@ -12,6 +12,7 @@ import (
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/manifest"
 	"github.com/torrin-app/torrin/shared/plans"
+	"github.com/torrin-app/torrin/shared/stremioid"
 )
 
 func TestTorzRoutesRegistered(t *testing.T) {
@@ -149,18 +150,6 @@ func TestColdPullBlocked(t *testing.T) {
 	}
 }
 
-func TestImdbFromSID(t *testing.T) {
-	if got := imdbFromSID("tt0903747:4:5"); got != "0903747" {
-		t.Errorf("series = %q", got)
-	}
-	if got := imdbFromSID("tt0816692"); got != "0816692" {
-		t.Errorf("movie = %q", got)
-	}
-	if got := imdbFromSID("kitsu:123"); got != "" {
-		t.Errorf("non-imdb should be empty, got %q", got)
-	}
-}
-
 func TestFileEntry(t *testing.T) {
 	e := fileEntry(2, "the.100.s02e01.mkv", 3517219191, "https://beam/link", nil)
 	if e["path"] != "/the.100.s02e01.mkv" {
@@ -216,6 +205,21 @@ func TestMagnetDataFallsBackToJobFilesWithoutManifest(t *testing.T) {
 	}
 	if files[1]["name"] != "Reborn.Rookie.S01.1080p/Reborn.Rookie.S01E07.mkv" {
 		t.Errorf("fallback name = %q, want job file name", files[1]["name"])
+	}
+}
+
+func TestMagnetDataFiltersUsingCurrentTarget(t *testing.T) {
+	m := manifest.Manifest{InfoHash: "abc", Name: "Paw.Patrol.Pack", Files: []manifest.File{
+		{FileName: "Paw.Patrol.S05E01.mkv", FileSize: 100},
+		{FileName: "Paw.Patrol.S12E01.mkv", FileSize: 200},
+	}}
+	data, _ := m.Marshal()
+	h := &Handler{Deps: Deps{Store: fakeStore{manifest: data}}}
+	stale := &jobs.Job{InfoHash: "abc", UserID: "u", Status: jobs.StatusComplete, Season: 12, Episode: 1}
+
+	files := h.magnetDataForTarget(context.Background(), stale, stremioid.Parse("tt3121722:5:1"))["files"].([]map[string]any)
+	if len(files) != 1 || files[0]["name"] != "Paw.Patrol.S05E01.mkv" {
+		t.Fatalf("files = %+v, want only current S05E01", files)
 	}
 }
 

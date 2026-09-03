@@ -64,7 +64,7 @@ func usenetEntitled(hasOwnCreds bool, plan plans.Plan) bool {
 
 func userJobForHash(sibs []*jobs.Job, userID string) *jobs.Job {
 	for _, j := range sibs {
-		if j.UserID == userID && j.Status != jobs.StatusFailed {
+		if j.UserID == userID && j.Status != jobs.StatusFailed && j.Status != jobs.StatusEvicted {
 			return j
 		}
 	}
@@ -150,6 +150,14 @@ func (s *Server) ingestNZB(w http.ResponseWriter, r *http.Request, user *auth.Us
 		return
 	}
 
+	if existing := userJobForHash(sibs, user.ID); existing != nil {
+		if !existing.Status.Active() {
+			existing.StreamURLs = s.signStreams(existing, r)
+		}
+		web.WriteJSON(w, 200, existing)
+		return
+	}
+
 	if manifest.Playable(r.Context(), s.Store, hash) {
 		job, err := s.buildCachedJob(r.Context(), hash, "", user.ID, jobs.SourceUsenet)
 		if err != nil {
@@ -167,13 +175,6 @@ func (s *Server) ingestNZB(w http.ResponseWriter, r *http.Request, user *auth.Us
 	}
 
 	if existing, err := s.Jobs.GetByInfoHash(r.Context(), hash); err == nil && existing != nil && existing.Status != jobs.StatusFailed {
-		if existing.UserID == user.ID {
-			if !existing.Status.Active() {
-				existing.StreamURLs = s.signStreams(existing, r)
-			}
-			web.WriteJSON(w, 200, existing)
-			return
-		}
 		linked := &jobs.Job{
 			UserID: user.ID, InfoHash: hash, Name: existing.Name, Source: jobs.SourceUsenet,
 			Status: existing.Status, Files: existing.Files, FileSize: existing.FileSize, Node: existing.Node,
@@ -186,11 +187,13 @@ func (s *Server) ingestNZB(w http.ResponseWriter, r *http.Request, user *auth.Us
 				writeQueueError(w, err, s.Slots.MaxQueued())
 				return
 			}
-			linked.Node = existing.Node
-			if disposition == jobs.AdmissionAdmitted && existing.Status != jobs.StatusQueued {
-				linked.Status = existing.Status
+			if disposition != jobs.AdmissionExisting {
+				linked.Node = existing.Node
+				if disposition == jobs.AdmissionAdmitted && existing.Status != jobs.StatusQueued {
+					linked.Status = existing.Status
+				}
+				s.Jobs.Update(r.Context(), linked)
 			}
-			s.Jobs.Update(r.Context(), linked)
 		} else if err := s.Jobs.Create(r.Context(), linked); err != nil {
 			web.WriteError(w, 500, "could not start this download")
 			return

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/manifest"
 	"github.com/torrin-app/torrin/shared/storage"
+	"github.com/torrin-app/torrin/shared/stremioid"
 )
 
 type Server struct {
@@ -67,35 +70,28 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	byos := s.userHasBYOS(r.Context(), user.ID)
-	imdbID, infoHash := parseID(contentID)
-	var streams []map[string]any
-	if infoHash != "" {
-		streams = append(streams, s.byHash(r, infoHash, user.ID, byos)...)
+	id := stremioid.Parse(contentID)
+	if !streamTargetMatchesType(r.PathValue("type"), id) {
+		writeJSON(w, 200, empty)
+		return
 	}
-	if imdbID != "" {
-		streams = append(streams, s.byLibrary(r, r.PathValue("type"), imdbID, user.ID, byos)...)
+	var streams []map[string]any
+	if id.InfoHash != "" {
+		streams = append(streams, s.byHash(r, id.InfoHash, user.ID, byos)...)
+	}
+	if id.IMDBID != "" {
+		streams = append(streams, s.byLibrary(r, r.PathValue("type"), id, user.ID, byos)...)
 	}
 
 	if len(streams) == 0 {
 		writeJSON(w, 200, empty)
 		return
 	}
-	if infoHash != "" {
-		s.jobs.RecordView(r.Context(), infoHash, user.ID)
+	if id.InfoHash != "" {
+		s.jobs.RecordView(r.Context(), id.InfoHash, user.ID)
 	}
 	slog.Info("stremio: served", "user", user.ID, "id", contentID, "streams", len(streams))
 	writeJSON(w, 200, map[string]any{"streams": streams})
-}
-
-func parseID(contentID string) (imdbID, infoHash string) {
-	candidate := strings.Split(contentID, ":")[0]
-	if strings.HasPrefix(candidate, "tt") {
-		return strings.TrimPrefix(candidate, "tt"), ""
-	}
-	if len(candidate) == 40 {
-		return "", strings.ToLower(candidate)
-	}
-	return "", ""
 }
 
 func (s *Server) byHash(r *http.Request, infoHash, userID string, byos bool) []map[string]any {
@@ -110,7 +106,7 @@ func (s *Server) byHash(r *http.Request, infoHash, userID string, byos bool) []m
 	}
 	var out []map[string]any
 	for _, f := range man.Files {
-		out = append(out, entry(f.FileName, s.streamURL(r, infoHash, f.DirectURL, userID, byos, f.Enc)))
+		out = append(out, entry(f.FileName, s.streamURL(r, infoHash, f.DirectURL, userID, byos, f.Enc), infoHash, f.FileSize))
 	}
 	return out
 }
@@ -131,32 +127,36 @@ func (s *Server) streamURL(r *http.Request, infoHash, key, userID string, byos, 
 	return georoute.URL(r, u)
 }
 
-func (s *Server) byLibrary(r *http.Request, contentType, imdbID, userID string, byos bool) []map[string]any {
+func (s *Server) byLibrary(r *http.Request, contentType string, id stremioid.ID, userID string, byos bool) []map[string]any {
 	ctx := r.Context()
 	seen := map[string]bool{}
 	var out []map[string]any
 	add := func(list []*jobs.Job) {
 		for _, j := range list {
-			if seen[j.InfoHash] {
+			if j == nil || j.InfoHash == "" || seen[j.InfoHash] {
+				continue
+			}
+			files := jobs.FilesForEpisode(j, j.Files, id.Season, id.Episode)
+			if len(files) == 0 {
 				continue
 			}
 			seen[j.InfoHash] = true
-			for i, f := range j.Files {
-				key := manifest.ResolveKey(j.InfoHash, i, f.Key, f.Name)
-				out = append(out, entry(f.Name, s.streamURL(r, j.InfoHash, key, userID, byos, f.Enc)))
+			for _, f := range files {
+				key := manifest.ResolveKey(j.InfoHash, f.Index, f.Key, f.Name)
+				out = append(out, entry(f.Name, s.streamURL(r, j.InfoHash, key, userID, byos, f.Enc), j.InfoHash, f.Size))
 			}
 		}
 	}
 
-	byImdb, _ := s.jobs.ListByIMDB(ctx, imdbID)
+	byImdb, _ := s.jobs.ListByIMDB(ctx, id.IMDBID)
 	add(byImdb)
 
 	if byos {
-		byosOwn, _ := s.jobs.ListUserByosByIMDB(ctx, userID, imdbID)
+		byosOwn, _ := s.jobs.ListUserByosByIMDB(ctx, userID, id.IMDBID)
 		add(byosOwn)
 	}
 
-	if title, err := s.meta.Title(ctx, imdbID, contentType); err == nil {
+	if title, err := s.meta.Title(ctx, id.IMDBID, contentType); err == nil {
 		if norm := jobs.NormTitle(title); norm != "" {
 			byTitle, _ := s.jobs.ListByTitleNorm(ctx, norm)
 			add(byTitle)
@@ -165,14 +165,39 @@ func (s *Server) byLibrary(r *http.Request, contentType, imdbID, userID string, 
 	return out
 }
 
-func entry(title, url string) map[string]any {
+func streamTargetMatchesType(contentType string, id stremioid.ID) bool {
+	if id.InfoHash != "" {
+		return contentType == "movie" || contentType == "series"
+	}
+	switch contentType {
+	case "movie":
+		return id.IMDBID != "" && !id.IsEpisode()
+	case "series":
+		return id.IsEpisode()
+	default:
+		return false
+	}
+}
+
+func entry(title, streamURL, infoHash string, size int64) map[string]any {
+	filename := path.Base(strings.ReplaceAll(title, `\`, "/"))
+	parsedURL, _ := url.Parse(streamURL)
+	hints := map[string]any{
+		"filename":    filename,
+		"notWebReady": parsedURL.Scheme != "https" || !strings.EqualFold(path.Ext(filename), ".mp4"),
+	}
+	if infoHash != "" {
+		hints["bingeGroup"] = "torrin:" + strings.ToLower(infoHash)
+	}
+	if size > 0 {
+		hints["videoSize"] = size
+	}
 	return map[string]any{
-		"name":  "Torrin",
-		"title": title,
-		"url":   url,
-		"behaviorHints": map[string]any{
-			"notWebReady": strings.HasSuffix(title, ".mkv"),
-		},
+		"name":          "Torrin",
+		"title":         filename,
+		"description":   filename,
+		"url":           streamURL,
+		"behaviorHints": hints,
 	}
 }
 

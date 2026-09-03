@@ -13,6 +13,7 @@ type Admission string
 const (
 	AdmissionAdmitted Admission = "admitted"
 	AdmissionQueued   Admission = "queued"
+	AdmissionExisting Admission = "existing"
 )
 
 var ErrQueueFull = errors.New("download queue full")
@@ -37,6 +38,22 @@ func (p *Postgres) Admit(ctx context.Context, j *Job, maxConcurrent, maxQueued i
 
 	if err := lockAdmission(ctx, tx, j.UserID, j.BudgetGated); err != nil {
 		return "", err
+	}
+	if hasLiveUserIdentity(j) {
+		existing, existingErr := scanOne(tx.QueryRow(ctx, `SELECT `+cols+` FROM jobs
+			WHERE user_id=$1 AND lower(info_hash)=lower($2) AND seed=false
+			AND status NOT IN ('failed','evicted')
+			ORDER BY created_at DESC, id DESC LIMIT 1`, j.UserID, j.InfoHash))
+		if existingErr == nil {
+			*j = *existing
+			if err := tx.Commit(ctx); err != nil {
+				return "", err
+			}
+			return AdmissionExisting, nil
+		}
+		if !errors.Is(existingErr, ErrNotFound) {
+			return "", existingErr
+		}
 	}
 	queued, err := queuedCountTx(ctx, tx, j.UserID, "")
 	if err != nil {
@@ -66,8 +83,23 @@ func (p *Postgres) Admit(ctx context.Context, j *Job, maxConcurrent, maxQueued i
 	} else {
 		j.Status = StatusPending
 	}
-	if err := insertJob(ctx, tx, j); err != nil {
+	created, err := insertJob(ctx, tx, j)
+	if err != nil {
 		return "", err
+	}
+	if !created {
+		existing, existingErr := scanOne(tx.QueryRow(ctx, `SELECT `+cols+` FROM jobs
+			WHERE user_id=$1 AND lower(info_hash)=lower($2) AND seed=false
+			AND status NOT IN ('failed','evicted')
+			ORDER BY created_at DESC, id DESC LIMIT 1`, j.UserID, j.InfoHash))
+		if existingErr != nil {
+			return "", existingErr
+		}
+		*j = *existing
+		if err := tx.Commit(ctx); err != nil {
+			return "", err
+		}
+		return AdmissionExisting, nil
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", err
@@ -96,6 +128,21 @@ func (p *Postgres) Readmit(ctx context.Context, id string, maxConcurrent, maxQue
 	job, err := scanOne(tx.QueryRow(ctx, `SELECT `+cols+` FROM jobs WHERE id=$1 FOR UPDATE`, id))
 	if err != nil {
 		return "", nil, err
+	}
+	if !job.Seed && job.UserID != "" && job.UserID != "system" && job.UserID != "prewarm" {
+		existing, existingErr := scanOne(tx.QueryRow(ctx, `SELECT `+cols+` FROM jobs
+			WHERE id<>$1 AND user_id=$2 AND lower(info_hash)=lower($3) AND seed=false
+			AND status NOT IN ('failed','evicted')
+			ORDER BY created_at DESC, id DESC LIMIT 1`, job.ID, job.UserID, job.InfoHash))
+		if existingErr == nil {
+			if err := tx.Commit(ctx); err != nil {
+				return "", nil, err
+			}
+			return AdmissionExisting, existing, nil
+		}
+		if !errors.Is(existingErr, ErrNotFound) {
+			return "", nil, existingErr
+		}
 	}
 	queued, err := queuedCountTx(ctx, tx, job.UserID, job.ID)
 	if err != nil {

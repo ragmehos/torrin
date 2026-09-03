@@ -137,6 +137,9 @@ func cleanNzbName(s string) string {
 }
 
 func (h *Handler) ensureNewzJob(ctx context.Context, user *auth.User, plan plans.Plan, contentHash, name string, size int64, body []byte) (string, int, string) {
+	if existing, err := h.Jobs.GetByUserInfoHash(ctx, user.ID, contentHash); err == nil && existing != nil {
+		return stStatus(existing.Status), 0, ""
+	}
 	if manifest.Playable(ctx, h.Store, contentHash) {
 		mName, mSize, files := h.manifestMeta(ctx, contentHash)
 		if mName != "" {
@@ -151,9 +154,6 @@ func (h *Handler) ensureNewzJob(ctx context.Context, user *auth.User, plan plans
 
 	if existing, err := h.Jobs.GetByInfoHash(ctx, contentHash); err == nil && existing != nil &&
 		existing.Status != jobs.StatusFailed && existing.Status != jobs.StatusEvicted {
-		if existing.UserID == user.ID {
-			return stStatus(existing.Status), 0, ""
-		}
 		linked := &jobs.Job{UserID: user.ID, InfoHash: contentHash, Name: existing.Name, Source: jobs.SourceUsenet, Status: existing.Status, Files: existing.Files, FileSize: existing.FileSize, Node: existing.Node}
 		active := existing.Status.Active()
 		if active {
@@ -164,11 +164,13 @@ func (h *Handler) ensureNewzJob(ctx context.Context, user *auth.User, plan plans
 				}
 				return "", 500, "could not queue this download"
 			}
-			linked.Node = existing.Node
-			if disposition == jobs.AdmissionAdmitted && existing.Status != jobs.StatusQueued {
-				linked.Status = existing.Status
+			if disposition != jobs.AdmissionExisting {
+				linked.Node = existing.Node
+				if disposition == jobs.AdmissionAdmitted && existing.Status != jobs.StatusQueued {
+					linked.Status = existing.Status
+				}
+				h.Jobs.Update(ctx, linked)
 			}
-			h.Jobs.Update(ctx, linked)
 		} else if err := h.Jobs.Create(ctx, linked); err != nil {
 			return "", 500, "could not start this download"
 		}

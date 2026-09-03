@@ -106,3 +106,75 @@ func TestPromoteQueuedFIFOAndSeedIsolation(t *testing.T) {
 		t.Fatalf("second not promoted: promoted=%v err=%v", promoted, err)
 	}
 }
+
+func TestAdmitReusesLiveUserHash(t *testing.T) {
+	repo, userID := queueTestPostgres(t)
+	ctx := context.Background()
+	hash := fmt.Sprintf("%040x", 201)
+	first := &Job{UserID: userID, InfoHash: hash, Source: SourceTorrent}
+	if d, err := repo.Admit(ctx, first, 2, 10, 1_000_000_000_000); err != nil || d != AdmissionAdmitted {
+		t.Fatalf("first disposition=%q err=%v", d, err)
+	}
+	second := &Job{UserID: userID, InfoHash: hash, Source: SourceTorrent}
+	if d, err := repo.Admit(ctx, second, 2, 10, 1_000_000_000_000); err != nil || d != AdmissionExisting {
+		t.Fatalf("second disposition=%q err=%v", d, err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("second id=%q, want canonical %q", second.ID, first.ID)
+	}
+}
+
+func TestCreateReusesLiveUserHashCaseInsensitively(t *testing.T) {
+	repo, userID := queueTestPostgres(t)
+	ctx := context.Background()
+	first := &Job{UserID: userID, InfoHash: "ABCDEF0123456789ABCDEF0123456789ABCDEF01", Source: SourceTorrent, Status: StatusComplete}
+	if err := repo.Create(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second := &Job{UserID: userID, InfoHash: "abcdef0123456789abcdef0123456789abcdef01", Source: SourceTorrent, Status: StatusComplete}
+	if err := repo.Create(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("second id=%q, want canonical %q", second.ID, first.ID)
+	}
+}
+
+func TestAdmitKeepsSameHashSeparateAcrossUsersAndBYOS(t *testing.T) {
+	repo, firstUserID := queueTestPostgres(t)
+	ctx := context.Background()
+	secondUserID := firstUserID + "-other"
+	hash := fmt.Sprintf("%040x", 202)
+	t.Cleanup(func() {
+		repo.Pool().Exec(context.Background(), `DELETE FROM byos_objects WHERE user_id IN ($1,$2)`, firstUserID, secondUserID)
+		repo.Pool().Exec(context.Background(), `DELETE FROM jobs WHERE user_id=$1`, secondUserID)
+	})
+
+	first := &Job{UserID: firstUserID, InfoHash: hash, Source: SourceTorrent}
+	if d, err := repo.Admit(ctx, first, 2, 10, 1_000_000_000_000); err != nil || d != AdmissionAdmitted {
+		t.Fatalf("first disposition=%q err=%v", d, err)
+	}
+	second := &Job{UserID: secondUserID, InfoHash: hash, Source: SourceTorrent}
+	if d, err := repo.Admit(ctx, second, 2, 10, 1_000_000_000_000); err != nil || d != AdmissionAdmitted {
+		t.Fatalf("second disposition=%q err=%v", d, err)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("cross-user jobs unexpectedly share id %q", first.ID)
+	}
+
+	files := []File{{Index: 0, Name: "Show.S12E03.mkv", Size: 1234}}
+	if err := repo.MarkBYOSObject(ctx, first.ID, firstUserID, hash, "first-bucket", "First", files); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.MarkBYOSObject(ctx, second.ID, secondUserID, hash, "second-bucket", "Second", files); err != nil {
+		t.Fatal(err)
+	}
+	firstObject, firstOK := repo.GetBYOSObjectByUserHash(ctx, firstUserID, hash)
+	secondObject, secondOK := repo.GetBYOSObjectByUserHash(ctx, secondUserID, hash)
+	if !firstOK || firstObject.Bucket != "first-bucket" {
+		t.Fatalf("first user's BYOS object = %+v, ok=%v", firstObject, firstOK)
+	}
+	if !secondOK || secondObject.Bucket != "second-bucket" {
+		t.Fatalf("second user's BYOS object = %+v, ok=%v", secondObject, secondOK)
+	}
+}

@@ -8,9 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/torrin-app/torrin/shared/pg"
 )
@@ -72,38 +70,16 @@ func (p *Postgres) Create(ctx context.Context, j *Job) error {
 	if err := prepareCreate(j); err != nil {
 		return err
 	}
-	return insertJob(ctx, p.pool, j)
-}
-
-type jobExecer interface {
-	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
-}
-
-func prepareCreate(j *Job) error {
-	if j.ID == "" {
-		id, err := uuid.NewV7()
-		if err != nil {
-			return err
-		}
-		j.ID = id.String()
+	created, err := insertJob(ctx, p.pool, j)
+	if err != nil || created || !hasLiveUserIdentity(j) {
+		return err
 	}
-	now := time.Now().UTC()
-	j.CreatedAt, j.UpdatedAt = now, now
+	existing, err := p.GetByUserInfoHash(ctx, j.UserID, j.InfoHash)
+	if err != nil {
+		return err
+	}
+	*j = *existing
 	return nil
-}
-
-func insertJob(ctx context.Context, db jobExecer, j *Job) error {
-	files, _ := json.Marshal(j.Files)
-	idxs, _ := json.Marshal(j.SelectedIdxs)
-	_, err := db.Exec(ctx, `
-		INSERT INTO jobs (id, user_id, info_hash, name, magnet, source, status, error,
-			files, selected_idxs, imdb_id, title_norm, season, episode, file_size, max_bytes, priority,
-			node, created_at, updated_at, seed, budget_gated, input_key)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
-		j.ID, j.UserID, j.InfoHash, j.Name, j.Magnet, string(j.Source), string(j.Status),
-		j.Error, files, idxs, j.IMDBID, titleNormFromName(j.Name), j.Season, j.Episode, j.FileSize, j.MaxBytes, j.Priority,
-		j.Node, j.CreatedAt, j.UpdatedAt, j.Seed, j.BudgetGated, j.InputKey)
-	return err
 }
 
 func (p *Postgres) Update(ctx context.Context, j *Job) error {
@@ -155,11 +131,11 @@ func (p *Postgres) Get(ctx context.Context, id string) (*Job, error) {
 
 func (p *Postgres) GetByInfoHash(ctx context.Context, infoHash string) (*Job, error) {
 	return scanOne(p.pool.QueryRow(ctx,
-		`SELECT `+cols+` FROM jobs WHERE info_hash=$1 ORDER BY created_at DESC LIMIT 1`, infoHash))
+		`SELECT `+cols+` FROM jobs WHERE lower(info_hash)=lower($1) ORDER BY created_at DESC LIMIT 1`, infoHash))
 }
 
 func (p *Postgres) ListByInfoHash(ctx context.Context, infoHash string) ([]*Job, error) {
-	return p.query(ctx, `SELECT `+cols+` FROM jobs WHERE info_hash=$1`, infoHash)
+	return p.query(ctx, `SELECT `+cols+` FROM jobs WHERE lower(info_hash)=lower($1)`, infoHash)
 }
 
 func (p *Postgres) CachedByHashes(ctx context.Context, hashes []string) (map[string]*Job, error) {

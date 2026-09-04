@@ -139,6 +139,17 @@ CREATE TABLE IF NOT EXISTS job_dedup_archive (
     archived_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- One-time dedup + unique index. Guarded on the index so only the first boot
+-- after deploy does the heavy work; once it exists, every later boot skips the
+-- ranking scan and the write-blocking lock entirely.
+DO $mig$
+DECLARE
+    mapping RECORD;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_jobs_one_live_user_hash') THEN
+        RETURN;
+    END IF;
+
 -- Close the cleanup/index race with older API replicas. Reads continue, while
 -- job writes pause for this transaction and resume once uniqueness is active.
 LOCK TABLE jobs IN SHARE ROW EXCLUSIVE MODE;
@@ -214,11 +225,7 @@ WHERE keeper.id = m.keeper_id;
 -- These tables intentionally have no foreign keys. Move a duplicate's
 -- auxiliary state to the retained job, discarding it only when the retained job
 -- already has equivalent state.
-DO $$
-DECLARE
-    mapping RECORD;
-BEGIN
-    FOR mapping IN SELECT loser_id, keeper_id FROM job_dedup_map LOOP
+FOR mapping IN SELECT loser_id, keeper_id FROM job_dedup_map LOOP
         IF EXISTS (SELECT 1 FROM byos_objects WHERE job_id=mapping.keeper_id) THEN
             DELETE FROM byos_objects WHERE job_id=mapping.loser_id;
         ELSE
@@ -237,7 +244,6 @@ BEGIN
             UPDATE prewarm_fallbacks SET job_id=mapping.keeper_id WHERE job_id=mapping.loser_id;
         END IF;
     END LOOP;
-END $$;
 
 DELETE FROM jobs j
 USING job_dedup_map m
@@ -247,9 +253,11 @@ DROP TABLE job_dedup_map;
 
 -- Failed and evicted history can coexist with a current row. Seed jobs and
 -- internal system/prewarm rows have separate operational lifecycles.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_one_live_user_hash
+CREATE UNIQUE INDEX idx_jobs_one_live_user_hash
 ON jobs(user_id, lower(info_hash))
 WHERE user_id NOT IN ('', 'system', 'prewarm')
   AND info_hash <> ''
   AND seed = false
   AND status NOT IN ('failed', 'evicted');
+
+END $mig$;

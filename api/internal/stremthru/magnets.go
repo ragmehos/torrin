@@ -100,6 +100,7 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 		linked := &jobs.Job{
 			UserID: user.ID, InfoHash: infoHash, Name: existing.Name, Magnet: mag,
 			Source: source, Status: existing.Status, IMDBID: existing.IMDBID,
+			Season: target.Season, Episode: target.Episode,
 			Files: existing.Files, FileSize: existing.FileSize, Node: existing.Node,
 		}
 		if target.IMDBID != "" {
@@ -145,7 +146,7 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request, user *auth.U
 	}
 	job := &jobs.Job{
 		UserID: user.ID, InfoHash: infoHash, Magnet: mag, Name: name, FileSize: hdSize,
-		Source: source, IMDBID: target.IMDBID,
+		Source: source, IMDBID: target.IMDBID, Season: target.Season, Episode: target.Episode,
 		Status: jobs.StatusPending, MaxBytes: plan.MaxTorrentBytes, Priority: plan.Priority,
 	}
 	if cached {

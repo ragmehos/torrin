@@ -152,7 +152,7 @@ func (p *Postgres) NodeForInfoHash(ctx context.Context, infoHash string) string 
 	}
 	var node string
 	p.pool.QueryRow(ctx,
-		`SELECT COALESCE(node,'') FROM jobs WHERE info_hash=$1 AND status='complete' ORDER BY updated_at DESC LIMIT 1`,
+		`SELECT COALESCE(node,'') FROM jobs WHERE lower(info_hash)=lower($1) AND status='complete' ORDER BY updated_at DESC LIMIT 1`,
 		infoHash).Scan(&node)
 	return node
 }

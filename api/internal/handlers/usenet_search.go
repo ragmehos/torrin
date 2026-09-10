@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/torrin-app/torrin/api/internal/middleware"
 	"github.com/torrin-app/torrin/api/internal/web"
+	"github.com/torrin-app/torrin/shared/cinemeta"
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/plans"
 	"github.com/torrin-app/torrin/shared/usenet/indexer"
@@ -19,12 +19,7 @@ import (
 
 const usenetMaxPage = 100
 
-func fallbackQuery(title string, season, episode int) string {
-	if season > 0 && episode > 0 {
-		return fmt.Sprintf("%s S%02dE%02d", title, season, episode)
-	}
-	return title
-}
+var usenetMeta = cinemeta.NewClient()
 
 func (s *Server) registerUsenetSearchRoutes(mux *http.ServeMux, authMW func(http.Handler) http.Handler) {
 	mux.Handle("GET /api/usenet/search", authMW(http.HandlerFunc(s.usenetSearch)))
@@ -55,13 +50,14 @@ func (s *Server) resolveSources(ctx context.Context, userID string, plan plans.P
 }
 
 func (s *Server) usenetSearch(w http.ResponseWriter, r *http.Request) {
-	sources := s.resolveSources(r.Context(), middleware.GetUser(r).ID, middleware.GetPlan(r))
+	user := middleware.GetUser(r)
+	plan := middleware.GetPlan(r)
+	sources := s.resolveSources(r.Context(), user.ID, plan)
 	if len(sources) == 0 {
 		web.WriteError(w, 400, "configure a usenet indexer first")
 		return
 	}
 	q := r.URL.Query()
-	imdb, query, title := q.Get("imdb"), q.Get("q"), q.Get("title")
 	season, _ := strconv.Atoi(q.Get("season"))
 	episode, _ := strconv.Atoi(q.Get("ep"))
 	offset, _ := strconv.Atoi(q.Get("offset"))
@@ -72,18 +68,41 @@ func (s *Server) usenetSearch(w http.ResponseWriter, r *http.Request) {
 	if limit > usenetMaxPage {
 		limit = usenetMaxPage
 	}
-	if imdb == "" && query == "" {
+	p := indexer.Params{IMDB: q.Get("imdb"), Query: q.Get("q"), Title: q.Get("title"), Cat: q.Get("cat"), Season: season, Episode: episode, Offset: offset, Limit: limit}
+	if p.IMDB == "" && p.Query == "" {
 		web.WriteError(w, 400, "provide imdb, q, or imdb+season+ep")
 		return
 	}
-	merged := indexer.FanOut(r.Context(), sources, 18*time.Second, func(c *indexer.Client) ([]indexer.Result, error) {
-		return s.searchOne(c, imdb, query, title, q.Get("cat"), q.Get("season"), q.Get("ep"), season, episode, offset, limit)
-	})
-	results := indexer.Verify(indexer.Dedup(merged), imdb, title, season, episode)
-	if results == nil {
-		results = []indexer.Result{}
+	if p.Title == "" && p.IMDB != "" {
+		ct := "movie"
+		if p.Season > 0 && p.Episode > 0 {
+			ct = "series"
+		}
+		if t, err := usenetMeta.Title(r.Context(), p.IMDB, ct); err == nil && t != "" {
+			p.Title = t
+		}
 	}
-	web.WriteJSON(w, 200, results)
+	web.WriteJSON(w, 200, s.usenetResults(r.Context(), user.ID, plan.ID, sources, p))
+}
+
+type busRequester interface {
+	RequestJSON(subject string, payload any, timeout time.Duration) ([]byte, error)
+}
+
+func (s *Server) usenetResults(ctx context.Context, userID, planID string, sources []indexer.Source, p indexer.Params) []indexer.Result {
+	if rq, ok := s.Bus.(busRequester); ok {
+		req := indexer.SearchRequest{UserID: userID, PlanID: planID, Params: p}
+		if data, err := rq.RequestJSON(indexer.SearchSubject, req, 22*time.Second); err == nil {
+			var resp indexer.SearchResponse
+			if json.Unmarshal(data, &resp) == nil && resp.Error == "" {
+				if resp.Results == nil {
+					return []indexer.Result{}
+				}
+				return resp.Results
+			}
+		}
+	}
+	return indexer.Search(ctx, sources, p)
 }
 
 func parseCachedTarget(raw string) (imdb string, season, episode int) {
@@ -132,33 +151,6 @@ func (s *Server) usenetCached(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	web.WriteJSON(w, 200, out)
-}
-
-func (s *Server) searchOne(c *indexer.Client, imdb, query, title, cat, seasonStr, epStr string, season, episode, offset, limit int) ([]indexer.Result, error) {
-	key := strings.Join([]string{c.BaseURL(), imdb, query, title, cat, seasonStr, epStr, strconv.Itoa(offset), strconv.Itoa(limit)}, "|")
-	if cached, hit := usenetCacheGet(key); hit {
-		return cached, nil
-	}
-	var results []indexer.Result
-	var err error
-	switch {
-	case imdb != "" && season > 0 && episode > 0:
-		results, err = c.SearchTV(imdb, season, episode, offset, limit)
-	case imdb != "":
-		results, err = c.SearchMovie(imdb, offset, limit)
-	default:
-		results, err = c.SearchQuery(query, cat, offset, limit)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if imdb != "" && title != "" && len(indexer.Verify(results, imdb, title, season, episode)) == 0 {
-		if fb, e := c.SearchQuery(fallbackQuery(title, season, episode), "", offset, limit); e == nil {
-			results = append(results, fb...)
-		}
-	}
-	usenetCacheSet(key, results)
-	return results, nil
 }
 
 func (s *Server) usenetGrab(w http.ResponseWriter, r *http.Request) {

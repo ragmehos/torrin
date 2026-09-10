@@ -201,11 +201,22 @@ func main() {
 	}
 
 	safety.Refresh(ctx, users.GetBlocklist, time.Hour)
-	go walletRenewLoop(ctx, users)
+	go walletRenewLoop(ctx, users, queue.Wake)
 	go queue.Run(ctx)
-	bus.Subscribe(b, events.JobComplete, func(events.Complete) { queue.Wake() })
-	bus.Subscribe(b, events.JobFailed, func(events.Failed) { queue.Wake() })
-	bus.Subscribe(b, events.JobDeleted, func(events.Deleted) { queue.Wake() })
+	if _, err := bus.Subscribe(b, events.JobComplete, func(c events.Complete) {
+		if job, err := jobsRepo.Get(ctx, c.JobID); err == nil && job != nil && job.InputKey != "" {
+			store.Delete(ctx, job.InputKey)
+		}
+		queue.Wake()
+	}); err != nil {
+		slog.Error("subscribe job complete", "err", err)
+	}
+	if _, err := bus.Subscribe(b, events.JobFailed, func(events.Failed) { queue.Wake() }); err != nil {
+		slog.Error("subscribe job failed", "err", err)
+	}
+	if _, err := bus.Subscribe(b, events.JobDeleted, func(events.Deleted) { queue.Wake() }); err != nil {
+		slog.Error("subscribe job deleted", "err", err)
+	}
 	go prewarmRetry(ctx, jobsRepo, b, pwMaxBytes, pwMaxActive)
 	go srv.RunRSSWorker(ctx)
 	go metricsSnapshot(ctx, jobsRepo, users)

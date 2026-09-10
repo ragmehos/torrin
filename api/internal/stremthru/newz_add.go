@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"github.com/torrin-app/torrin/shared/auth"
-	"github.com/torrin-app/torrin/shared/cluster"
-	"github.com/torrin-app/torrin/shared/events"
 	"github.com/torrin-app/torrin/shared/jobs"
 	"github.com/torrin-app/torrin/shared/keyed"
 	"github.com/torrin-app/torrin/shared/manifest"
@@ -192,9 +190,7 @@ func (h *Handler) ensureNewzJob(ctx context.Context, user *auth.User, plan plans
 		return "", 500, "could not queue this download"
 	}
 	if disposition == jobs.AdmissionAdmitted {
-		job.Node = cluster.TargetNode(context.Background(), h.Jobs, string(jobs.SourceUsenet), job.MaxBytes)
-		h.Jobs.Update(context.Background(), job)
-		h.Bus.Publish(events.JobAssigned, events.Assigned{JobID: job.ID, InfoHash: job.InfoHash, Source: string(jobs.SourceUsenet), MaxBytes: job.MaxBytes, Node: job.Node})
+		h.assign(job)
 	}
 	return stStatus(job.Status), 0, ""
 }

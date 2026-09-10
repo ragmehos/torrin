@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -130,7 +131,11 @@ func (s *Server) importHashes(w http.ResponseWriter, r *http.Request) {
 		}
 		disposition, err := s.Slots.Admit(r.Context(), job, plan, true)
 		if err != nil {
-			errs = append(errs, h+": "+err.Error())
+			if errors.Is(err, jobs.ErrQueueFull) {
+				errs = append(errs, h+": download queue full")
+			} else {
+				errs = append(errs, h+": could not queue this download")
+			}
 			continue
 		}
 		if disposition == jobs.AdmissionAdmitted {

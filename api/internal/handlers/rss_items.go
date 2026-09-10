@@ -93,7 +93,7 @@ func (s *Server) rssSubmit(ctx context.Context, feed *auth.RSSFeed, user *auth.U
 		s.Users.MarkRSSSeen(ctx, feed.ID, item.GUID)
 		return false, false
 	}
-	disposition, err := s.Slots.Admit(ctx, job, plan, false)
+	disposition, err := s.Slots.Admit(ctx, job, plan, true)
 	if err != nil {
 		return false, errors.Is(err, jobs.ErrQueueFull)
 	}
@@ -155,7 +155,7 @@ func (s *Server) rssUsenet(ctx context.Context, feed *auth.RSSFeed, user *auth.U
 		}
 		job.Files = append(job.Files, jobs.File{Index: i, Name: f.Subject, Size: fsize})
 	}
-	disposition, err := s.Slots.Admit(ctx, job, plan, false)
+	disposition, err := s.Slots.Admit(ctx, job, plan, true)
 	if err != nil {
 		return false, errors.Is(err, jobs.ErrQueueFull)
 	}

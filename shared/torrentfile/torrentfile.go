@@ -47,8 +47,8 @@ func Parse(data []byte) (*Meta, error) {
 
 func XSeedKey(infoHash string) string { return "xseed/" + infoHash + ".torrent" }
 
-func InputKey(userID, infoHash string) string {
-	return "torrent-input/" + userID + "/" + infoHash + ".torrent"
+func InputKey(userID, slug string) string {
+	return "torrent-input/" + userID + "/" + slug + ".torrent"
 }
 
 func (m *Meta) Sizes() []int64 {
